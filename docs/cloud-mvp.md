@@ -1,6 +1,7 @@
 # AgentGuard Cloud — MVP Design
 
-Status: **draft / planning** (no code yet). Owner: TBD. Last updated: 2026-06-17.
+Status: **M0 built** (agent-side redaction pipeline + local sink); M1+ planning.
+Owner: TBD. Last updated: 2026-06-18.
 
 This document sketches the smallest **sellable** cloud layer on top of the local
 AgentGuard agent, and the agent-side changes required to feed it — without ever
@@ -39,7 +40,7 @@ tried to leak, set policy once, get alerted — and secrets never leave the mach
 │                                      │                           │
 │                          Evaluate() / Scan()                     │
 │                                      │                           │
-│                          writeAudit / writeScanAudit  ──> audit.log (local, full)
+│                          audit.Evaluate / audit.Scan  ──> audit.log (local, full)
 │                                      │                           │
 │                          redact()  ── allowlist only ──┐         │
 │                                      │                  │         │
@@ -75,9 +76,9 @@ a bug (see §5 redaction test).
   "ts": "2026-06-17T15:07:58Z",
   "device_id": "uuid",           // from enrollment, not PII
   "org_id": "uuid",              // from enrollment token
-  "agent": "cursor",             // claude-code | cursor
+  "agent": "cursor",             // claude-code | cursor | codex
   "tool": "Prompt",              // Prompt | Bash | Read | mcp__<server>__<tool>
-  "decision": "deny",            // allow | deny | ask | block
+  "decision": "deny",            // allow | deny | ask
   "reason": "2 secrets detected in prompt (AWS access key id, GitLab Private Token)",
   "source": "builtin",           // first finding's backend
   "rule": "AWS access key id",   // first finding's rule
@@ -104,32 +105,49 @@ scanning — but it is discarded immediately and never logged.)
 
 ## 4. Agent-side work (Go, this repo)
 
-Small, self-contained additions. Maps onto existing code:
+Small, self-contained additions. Maps onto existing code. **Items 1–3 are built
+(M0)**; the file/queue/enrollment details below note where M0 reality and the
+forward-looking design differ.
 
-1. **`redact(ScanResult, HookEvent/agent) -> CloudEvent`** — a new boundary
-   function. Builds the §3 struct from the data `writeScanAudit`
-   (`main.go`) / `writeAudit` (`main.go`) already have. The local audit log is
-   unchanged; redaction is a *second*, stricter projection.
-2. **Event shipper** (`cloud.go`, new): append events to a bounded on-disk queue
-   (`~/.agentguard/queue/`), flush in the background, retry with backoff, drop
-   oldest on overflow. Never blocks the hook path. **Fans the same redacted event
-   out to one or more sinks** (see §4a) — independent retry/cursor per sink.
-3. **Config** (`Config` in `policy.go` + `config.json`): add
+1. **`RedactEvaluate` / `RedactScan` → `CloudEvent`** (`internal/cloud/redact.go`,
+   built) — the single redaction boundary. Builds the §3 struct from the same data
+   `audit.Evaluate` / `audit.Scan` (`internal/audit/audit.go`) already record. The
+   local audit log is unchanged; redaction is a *second*, stricter projection.
+2. **Event shipper** (`internal/cloud/shipper.go`, built): a `Shipper` fed by a
+   bounded **in-memory** queue (`queueDepth`, drop-*newest* on overflow with a
+   counter) drained by a background goroutine, fanning each event out to one or
+   more `Sink`s. Never blocks the hook path. Two sink types implement the `Sink`
+   interface: `FileSink` (M0 — NDJSON at `~/.agentguard/events.ndjson`) and
+   `HTTPSink` (`internal/cloud/httpsink.go` — POSTs each event to an ingest
+   endpoint with an optional bearer token; bounded timeout + a few quick retries).
+   *Still deferred:* a durable on-disk replay queue (`~/.agentguard/queue/`) with
+   long per-sink backoff so events survive the daemon being offline.
+3. **Config** (`CloudConfig`/`CloudSink` in `internal/types/types.go` + `config.json`,
+   built; off by default): add
    ```jsonc
    "cloud": {
      "enabled": false,
      "sinks": [
        {
-         "name": "agentguard",                        // label for logs/dashboard
+         "name": "local",          // M0 (built): local NDJSON, zero infra
+         "type": "file",
+         "path": ""                // defaults to ~/.agentguard/events.ndjson
+       },
+       {
+         "name": "agentguard",     // HTTPSink (built): POSTs events to an ingest API
+         "type": "https",
          "endpoint": "https://ingest.agentguard.dev",
-         "enrollment_token": "",   // exchanged once for a device_id + device token
-         "org_salt": ""            // provisioned at enrollment, per sink
+         "enrollment_token": "",   // sent as Bearer; future: exchanged for a device token
+         "org_salt": ""            // provisioned at enrollment, per sink (not yet used)
        }
        // add a second sink here for a customer's self-hosted plane / SIEM
      ]
    }
    ```
-   Defaults off (empty `sinks`) → the OSS agent is cloud-free unless enrolled.
+   Defaults off (`enabled:false` / empty `sinks`) → the OSS agent is cloud-free
+   unless enrolled. Unknown sink types are skipped with a warning rather than
+   failing the daemon. For local end-to-end testing of the HTTPS sink, point
+   `endpoint` at the preview server in `tools/cloud-preview/`.
 4. **Enrollment**: `agentguard enroll --token <org-token> [--sink <name>]` → calls
    that sink's endpoint, stores `device_id` + device token + `org_salt` against the
    named sink locally. One-time per sink.
@@ -234,11 +252,15 @@ Stack chosen for speed-to-sellable. Supabase gives Postgres + auth + RLS.
 
 ## 8. Phased roadmap
 
-- **M0 — Agent pipeline (no cloud):** `redact()`, `cloud.go` shipper writing to a
-  local NDJSON sink, config, **redaction test**. Validates the contract with zero
-  infra. *(This is the recommended first build when we move past planning.)*
-- **M1 — Ingest + store:** Supabase schema + `POST /api/ingest`; agent ships over
-  HTTPS; enrollment.
+- **M0 — Agent pipeline (no cloud): ✅ built.** `RedactEvaluate`/`RedactScan`
+  (`internal/cloud/redact.go`), `Shipper` + `FileSink` writing local NDJSON
+  (`internal/cloud/shipper.go`), `cloud` config (off by default), and the
+  **redaction trust test** (`internal/cloud/redact_test.go`). Validates the
+  contract with zero infra.
+- **M1 — Ingest + store:** *in progress.* Agent ships over HTTPS via `HTTPSink`
+  (`internal/cloud/httpsink.go`, built) and a local preview ingest + dashboard
+  exists (`tools/cloud-preview/`). *Remaining:* real Supabase schema + persistent
+  `POST /api/ingest`, enrollment → device tokens, idempotency on `event_id`.
 - **M2 — Dashboard read views:** overview, events table, insights.
 - **M3 — Policy push + suppressions:** dashboard editor → agent pull → local
   suppression enforcement.

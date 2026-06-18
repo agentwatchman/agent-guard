@@ -18,21 +18,27 @@ import (
 	"time"
 
 	"agentguard/internal/audit"
+	"agentguard/internal/cloud"
 	"agentguard/internal/policy"
 	"agentguard/internal/scan"
 	"agentguard/internal/types"
 )
 
+// Version is the agent build version stamped onto shipped events. Set by main
+// (overridable via -ldflags); defaults to "dev" for tests/standalone runs.
+var Version = "dev"
+
 // Daemon holds the running daemon's state: the hot-swappable policy config, the
-// audit logger, a structured logger, and aggregate counters. Bundling it in a
-// struct (rather than package globals) keeps the state explicit, lets handlers
-// be methods, and makes the daemon testable.
+// audit logger, a structured logger, aggregate counters, and the optional cloud
+// shipper. Bundling it in a struct (rather than package globals) keeps the state
+// explicit, lets handlers be methods, and makes the daemon testable.
 type Daemon struct {
 	cfgMu sync.RWMutex
 	cfg   types.Config
 	audit *audit.Logger
 	log   *slog.Logger
 	met   metrics
+	ship  *cloud.Shipper // nil unless cloud shipping is enabled in config
 }
 
 // logger returns the daemon's structured logger, falling back to the default.
@@ -67,6 +73,17 @@ func Run(args []string) {
 	} else {
 		d.audit = l
 		defer d.audit.Close()
+	}
+
+	// Optional, additive cloud shipping (off unless configured). Built once from
+	// the initial config; toggling sinks requires a daemon restart (policy still
+	// hot-reloads). A nil shipper is fully nil-safe in the handlers.
+	if s, err := cloud.NewShipper(d.config().Cloud, logger); err != nil {
+		logger.Warn("cloud shipping disabled (bad sink config)", "err", err)
+	} else if s != nil {
+		d.ship = s
+		defer d.ship.Close()
+		logger.Info("cloud shipping enabled")
 	}
 
 	sock := types.SocketPath()
@@ -243,6 +260,7 @@ func (d *Daemon) handleEvaluate(w http.ResponseWriter, r *http.Request) {
 	}
 	d.met.recordEvaluate(resp.HookSpecificOutput.PermissionDecision)
 	d.audit.Evaluate(e, resp, dec.RuleID, dec.Severity)
+	d.ship.Ship(cloud.RedactEvaluate(e, resp, dec.RuleID, dec.Severity, Version))
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
@@ -259,6 +277,7 @@ func (d *Daemon) handleScan(w http.ResponseWriter, r *http.Request) {
 	res := scan.ScanAll(req)
 	d.met.recordScan(res.Found)
 	d.audit.Scan(res, req.Agent)
+	d.ship.Ship(cloud.RedactScan(res, req.Agent, Version))
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(res)

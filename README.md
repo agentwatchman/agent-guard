@@ -7,9 +7,10 @@ call to it, and it returns **allow / deny / ask** before the action runs.
 Nothing leaves the machine — evaluation is local, and only a redacted one-line
 record is written to a local audit log.
 
-This is the pilot build: **no cloud, no accounts, no multi-tenancy.** The goal
+This is the pilot build: **local-first, no accounts, no multi-tenancy.** The goal
 is to prove value on real machines (e.g. the Fyxer pilot) with the least moving
-parts.
+parts. Optional redacted [cloud shipping](#cloud-shipping-optional-off-by-default)
+exists but is **off by default**.
 
 ## Architecture
 
@@ -302,10 +303,45 @@ in the foreground (`make run`) prints those same `slog` lines to your terminal
 instead. `/metrics` returns a JSON snapshot, e.g.
 `{"evaluate_total":2,"evaluate_allow":1,"evaluate_deny":1,"scan_total":0,...}`.
 
+## Cloud shipping (optional, off by default)
+
+The agent can additionally ship a **redacted** projection of each decision/scan
+off the box — for fleet visibility — without weakening local enforcement. It is
+**disabled unless configured**, and enforcement never depends on it.
+
+- One redaction boundary (`internal/cloud/redact.go`) builds an allowlisted
+  `CloudEvent`: tool, decision, reason, rule, severity, finding `source`/`rule`,
+  and `cwd_base` (basename only). **Never** shipped: raw secret values, prompt
+  text, command strings, full paths, or session ids. A build-gating test
+  (`internal/cloud/redact_test.go`) asserts none of those substrings can leak.
+- A non-blocking `Shipper` (bounded in-memory queue, drop-newest on overflow,
+  surfaced as `cloud_dropped` in `/metrics`) fans events to one or more sinks off
+  the hook path. Two sink types ship today: `file` (local NDJSON at
+  `~/.agentguard/events.ndjson`) and `https` (POSTs each event to an ingest
+  endpoint). Fan-out is supported — run both at once.
+
+Enable by adding a `cloud` block to `~/.agentguard/config.json`:
+
+```jsonc
+"cloud": {
+  "enabled": true,
+  "sinks": [
+    { "name": "local",   "type": "file" },                                           // local NDJSON
+    { "name": "preview", "type": "https", "endpoint": "http://localhost:8000/api/ingest" }
+  ]
+}
+```
+
+The shipper is built once at daemon start, so set sinks **before** running.
+To watch events stream live over the `https` sink, use the local preview
+control plane in [`tools/cloud-preview/`](tools/cloud-preview/) (FastAPI ingest
++ dashboard). See [`docs/cloud-mvp.md`](docs/cloud-mvp.md) for the full design
+(enrollment, persistence, policy pull) and the redacted-event schema.
+
 ## What's next (post-pilot)
 
-- Local **secret redactor** + background **policy sync** from a cloud control
-  plane (the privacy-preserving architecture).
+- **HTTPS sink + enrollment** and background **policy sync** from a cloud control
+  plane (the redaction boundary and local shipper already land in M0, above).
 - **Dashboard** for fleet-wide policy + audit visibility.
 - **Tier 2+ detection** (classifier / behavioral / taint) behind the same
   `Evaluate()` interface.

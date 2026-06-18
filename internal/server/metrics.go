@@ -54,6 +54,8 @@ func (m *metrics) snapshot() map[string]int64 {
 }
 
 func (d *Daemon) handleMetrics(w http.ResponseWriter, _ *http.Request) {
+	snap := d.met.snapshot()
+	snap["cloud_dropped"] = d.ship.Dropped() // 0 when shipping is disabled (nil-safe)
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(d.met.snapshot())
+	_ = json.NewEncoder(w).Encode(snap)
 }

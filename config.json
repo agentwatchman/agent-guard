@@ -9,5 +9,12 @@
   "approved_mcp": [
     "github",
     "linear"
+  ],
+  "cloud": {
+  "enabled": true,
+  "sinks": [
+    { "name": "local",   "type": "file" },
+    { "name": "preview", "type": "https", "endpoint": "http://127.0.0.1:8000/api/ingest" }
   ]
+}
 }

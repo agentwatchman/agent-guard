@@ -42,6 +42,8 @@ func main() {
 		cmd, args = args[0], args[1:]
 	}
 
+	server.Version = version
+
 	switch cmd {
 	case "", "serve":
 		server.Run(args)
