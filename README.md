@@ -11,6 +11,78 @@ This is the pilot build: **no cloud, no accounts, no multi-tenancy.** The goal
 is to prove value on real machines (e.g. the Fyxer pilot) with the least moving
 parts.
 
+## Architecture
+
+Each agent is wired with **command hooks** that spawn `agentguard <agent>-hook`.
+That handler translates the agent's event into a common schema and asks the
+**daemon** over a Unix domain socket for a decision. The daemon runs the policy
+rule pipeline (tool calls) or the secret scanner (prompts), writes a redacted
+audit record, and returns **allow / deny / ask**. Everything stays local.
+
+```mermaid
+flowchart LR
+    subgraph Agents["AI coding agents"]
+        CC["Claude Code<br/>~/.claude/settings.json"]
+        CU["Cursor<br/>~/.cursor/hooks.json"]
+        CX["Codex<br/>~/.codex/hooks.json"]
+    end
+
+    subgraph Handler["Hook handler — agentguard (agent)-hook"]
+        H["registry resolves handler<br/>translate to HookEvent / ScanRequest<br/>fail CLOSED if daemon is down"]
+    end
+
+    CC -->|"PreToolUse / UserPromptSubmit"| H
+    CU -->|"preToolUse / beforeShellExecution<br/>beforeReadFile / beforeSubmitPrompt"| H
+    CX -->|"PreToolUse / UserPromptSubmit"| H
+
+    H <-->|"HTTP over Unix socket<br/>~/.agentguard/agentguard.sock"| D
+
+    subgraph Daemon["agentguard daemon"]
+        D{"router"}
+        EV["/v1/evaluate"]
+        SC["/v1/scan"]
+        MT["/metrics"]
+        D --> EV
+        D --> SC
+        D --> MT
+    end
+
+    EV --> POL["policy: ordered rule pipeline<br/>secret · egress · destructive · mcp<br/>allow / deny / ask<br/>(ask → deny if client can't ask)"]
+    SC --> SCN["scan: builtin regex + entropy"]
+    SCN <-->|"Unix socket (optional)"| KF["kingfisherd<br/>resident Kingfisher, 950+ rules"]
+
+    EV --> AUD["audit log<br/>~/.agentguard/audit.log<br/>redacted · rotating"]
+    SC --> AUD
+
+    CFG["config.json<br/>~/.agentguard/config.json<br/>allowed_egress · approved_mcp · disabled_rules"] -.->|"auto-reload (file watcher)"| D
+```
+
+Request flow for a single tool call:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Agent
+    participant H as agentguard hook
+    participant D as Daemon
+    participant P as Policy pipeline
+    participant L as Audit log
+
+    A->>H: tool-call event (stdin JSON)
+    H->>D: POST /v1/evaluate (Unix socket)
+    D->>P: EvaluateDetailed(cfg, event)
+    P-->>D: decision + rule id + severity
+    D->>D: downgrade ask → deny if client can't ask
+    D->>L: append redacted record
+    D-->>H: allow / deny / ask
+    H-->>A: permission decision (stdout)
+    Note over A,H: daemon unreachable → fail closed (deny / block)
+```
+
+Adding a new agent is a single entry in the agent registry
+(`internal/hooks/agent.go`); install, uninstall, the `--<agent>` CLI flag, and
+runtime dispatch all pick it up automatically.
+
 ## Quick start
 
 One command builds everything, installs the background daemon, wires up the
