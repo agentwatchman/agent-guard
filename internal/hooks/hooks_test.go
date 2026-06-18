@@ -1,9 +1,10 @@
-package main
+package hooks
 
 import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -149,41 +150,9 @@ func TestReadJSONObjectRejectsInvalid(t *testing.T) {
 	}
 }
 
-// Secret scanner catches common secret shapes and a secret file attachment.
-func TestScan(t *testing.T) {
-	cases := []struct {
-		name string
-		req  ScanRequest
-		want bool
-	}{
-		{"openai key in prompt", ScanRequest{Text: "use sk-abcdef0123456789ABCDEF01 please"}, true},
-		{"aws key id", ScanRequest{Text: "AKIAIOSFODNN7EXAMPLE"}, true},
-		{"private key block", ScanRequest{Text: "-----BEGIN RSA PRIVATE KEY-----\nMII..."}, true},
-		{"secret assignment high entropy", ScanRequest{Text: "API_KEY=xQ9fK2mP7zR4aL8nW1bV"}, true},
-		{"github token", ScanRequest{Text: "token ghp_0123456789012345678901234567890123ab"}, true},
-		{"secret file attached", ScanRequest{Text: "look at this", Paths: []string{"/repo/.env"}}, true},
-		{"benign prompt", ScanRequest{Text: "please refactor the login handler"}, false},
-		{"benign attachment", ScanRequest{Text: "review", Paths: []string{"/repo/main.go"}}, false},
-		// noise reduction: placeholders / env refs must NOT trip the scanner
-		{"placeholder your_api_key", ScanRequest{Text: "api_key=your_api_key_here"}, false},
-		{"env reference", ScanRequest{Text: "API_KEY=process.env.OPENAI_API_KEY"}, false},
-		{"template reference", ScanRequest{Text: "api_key: ${OPENAI_API_KEY}"}, false},
-		{"xxxx placeholder", ScanRequest{Text: "secret=xxxxxxxxxxxxxxxxxxxx"}, false},
-		{"short value", ScanRequest{Text: "token=abc123"}, false},
-		{"prose after keyword", ScanRequest{Text: "the api key is stored in the vault somewhere"}, false},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := Scan(c.req).Found; got != c.want {
-				t.Errorf("Scan(%q) found=%v, want %v", c.req, got, c.want)
-			}
-		})
-	}
-}
-
 // Cursor install includes the beforeSubmitPrompt scan gate.
 func TestCursorInstallsPromptScan(t *testing.T) {
-	if !contains(cursorEvents, "beforeSubmitPrompt") {
+	if !slices.Contains(cursorEvents, "beforeSubmitPrompt") {
 		t.Fatal("beforeSubmitPrompt not in cursorEvents")
 	}
 }

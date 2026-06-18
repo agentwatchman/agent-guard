@@ -13,7 +13,7 @@ KFSOCKET = $(HOME)/.agentguard/kingfisherd.sock
 
 # Local build
 build:
-	go build -o bin/agentguard .
+	go build -o bin/agentguard ./cmd/agentguard
 
 # Run the daemon with the example config
 run: build
@@ -26,10 +26,10 @@ test:
 # Cross-compile signed-ready binaries for the platforms Fyxer's devs use.
 # (Signing/notarization happens in your release pipeline, not here.)
 release:
-	GOOS=darwin  GOARCH=arm64 go build -o dist/agentguard-darwin-arm64 .
-	GOOS=darwin  GOARCH=amd64 go build -o dist/agentguard-darwin-amd64 .
-	GOOS=linux   GOARCH=amd64 go build -o dist/agentguard-linux-amd64 .
-	GOOS=windows GOARCH=amd64 go build -o dist/agentguard-windows-amd64.exe .
+	GOOS=darwin  GOARCH=arm64 go build -o dist/agentguard-darwin-arm64 ./cmd/agentguard
+	GOOS=darwin  GOARCH=amd64 go build -o dist/agentguard-darwin-amd64 ./cmd/agentguard
+	GOOS=linux   GOARCH=amd64 go build -o dist/agentguard-linux-amd64 ./cmd/agentguard
+	GOOS=windows GOARCH=amd64 go build -o dist/agentguard-windows-amd64.exe ./cmd/agentguard
 
 # --- Manual install path (no Homebrew) -------------------------------------
 # Installs the binary + config to $(PREFIX), then registers a launchd LaunchAgent

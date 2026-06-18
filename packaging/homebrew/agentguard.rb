@@ -27,8 +27,8 @@ class Agentguard < Formula
   depends_on "go" => :build
 
   def install
-    # Compiles ./main.go + ./policy.go into `agentguard`.
-    system "go", "build", *std_go_args(ldflags: "-s -w"), "."
+    # Compiles the cmd/agentguard entry point into `agentguard`.
+    system "go", "build", *std_go_args(ldflags: "-s -w"), "./cmd/agentguard"
 
     # Install the default policy config without clobbering a user's edits on
     # upgrade (Homebrew preserves files written into `etc`).
