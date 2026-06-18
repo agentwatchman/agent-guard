@@ -5,6 +5,9 @@
 PREFIX ?= /usr/local
 LABEL   = com.agentguard.daemon
 PLIST   = $(HOME)/Library/LaunchAgents/$(LABEL).plist
+# Policy config lives in the user's home (no sudo to edit) and the daemon
+# auto-reloads it on change.
+USERCFG = $(HOME)/.agentguard/config.json
 
 # Resident Kingfisher scanner (optional; gives inline scans the full rule set).
 KFLABEL  = com.agentguard.kingfisherd
@@ -35,14 +38,15 @@ release:
 # Installs the binary + config to $(PREFIX), then registers a launchd LaunchAgent
 # so the daemon runs in the background at login. macOS only.
 install: build
-	sudo install -d "$(PREFIX)/bin" "$(PREFIX)/etc/agentguard"
+	sudo install -d "$(PREFIX)/bin"
 	sudo install -m 0755 bin/agentguard "$(PREFIX)/bin/agentguard"
-	@[ -f "$(PREFIX)/etc/agentguard/config.json" ] \
-		&& echo "keeping existing $(PREFIX)/etc/agentguard/config.json" \
-		|| sudo install -m 0644 config.json "$(PREFIX)/etc/agentguard/config.json"
+	mkdir -p "$(HOME)/.agentguard"
+	@[ -f "$(USERCFG)" ] \
+		&& echo "keeping existing $(USERCFG)" \
+		|| install -m 0644 config.json "$(USERCFG)"
 	mkdir -p "$(HOME)/Library/LaunchAgents"
 	sed -e 's#/usr/local/bin/agentguard#$(PREFIX)/bin/agentguard#' \
-	    -e 's#/usr/local/etc/agentguard/config.json#$(PREFIX)/etc/agentguard/config.json#' \
+	    -e 's#CONFIG_PATH#$(USERCFG)#' \
 	    packaging/launchd/$(LABEL).plist > "$(PLIST)"
 	@# Robustly (re)load: clear any prior registration via BOTH the modern
 	@# (bootout) and legacy (unload/remove) APIs first, otherwise a half-
@@ -56,6 +60,7 @@ install: build
 	   || launchctl load -w "$(PLIST)" \
 	   || launchctl kickstart -k gui/$$(id -u)/$(LABEL)
 	@echo "AgentGuard running in the background (unix socket ~/.agentguard/agentguard.sock)"
+	@echo "Policy config: $(USERCFG) (edit it — the daemon auto-reloads within ~2s)"
 	@echo "Wiring detected AI agents (Claude Code / Cursor)..."
 	"$(PREFIX)/bin/agentguard" install-hooks
 
@@ -64,7 +69,7 @@ uninstall:
 	-launchctl bootout gui/$$(id -u)/$(LABEL) 2>/dev/null
 	rm -f "$(PLIST)"
 	sudo rm -f "$(PREFIX)/bin/agentguard"
-	@echo "Removed binary + service + agent hooks. Config kept at $(PREFIX)/etc/agentguard (delete manually if desired)."
+	@echo "Removed binary + service + agent hooks. Config kept at $(USERCFG) (delete manually if desired)."
 
 # --- Complete teardown -----------------------------------------------------
 # Removes EVERYTHING AgentGuard installed: both binaries, both launchd services,
@@ -216,10 +221,10 @@ uninstall-kingfisher:
 service-restart:
 	launchctl kickstart -k gui/$$(id -u)/$(LABEL)
 
-# Hot-reload config.json without restarting the daemon (SIGHUP). Use after
-# editing the installed config at $(PREFIX)/etc/agentguard/config.json.
+# Force a config reload via SIGHUP. Usually unnecessary: the daemon auto-reloads
+# $(USERCFG) within ~2s of an edit. Kept for scripted/immediate reloads.
 service-reload:
-	launchctl kill SIGHUP gui/$$(id -u)/$(LABEL) && echo "sent SIGHUP — config reloaded (check: log show or make service-status)"
+	launchctl kill SIGHUP gui/$$(id -u)/$(LABEL) && echo "sent SIGHUP — config reloaded (check: make service-status or tail /tmp/agentguard.err.log)"
 
 service-status:
 	launchctl print gui/$$(id -u)/$(LABEL) | grep -E 'state|pid' || echo "not loaded"

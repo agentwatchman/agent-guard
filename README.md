@@ -65,9 +65,13 @@ agentguard uninstall-hooks          # cleanly remove our entries
 - **Claude Code** gets a `PreToolUse` command hook (every tool call is checked)
   **and** a `UserPromptSubmit` hook (the prompt text is scanned for secrets
   before it's sent) — both run `agentguard claude-hook`.
-- **Cursor** gets `beforeShellExecution` + `beforeReadFile` +
+- **Cursor** gets `preToolUse` + `beforeShellExecution` + `beforeReadFile` +
   `beforeSubmitPrompt` command hooks (`agentguard cursor-hook`) with
-  `failClosed: true`.
+  `failClosed: true`. The generic **`preToolUse`** gate covers every tool that
+  lacks a dedicated hook (e.g. `WebFetch`); shell and file reads defer to
+  `beforeShellExecution` / `beforeReadFile` (no double-gating). Because Cursor's
+  `preToolUse` accepts but doesn't enforce `ask`, AgentGuard downgrades those to
+  a clean `deny`.
 
 The **`beforeSubmitPrompt`** gate is a ggshield-style secret scanner: before a
 prompt is sent, it scans the prompt text and any attached files for secrets and
@@ -113,7 +117,15 @@ private Homebrew tap, manual install, and Linux — is in
 | Call to an MCP server not in `approved_mcp` | **deny** |
 | Everything else | **allow** |
 
-Tune the allowlists in `config.json` — no rebuild needed (restart the daemon).
+> **`ask` across agents:** Claude Code renders `ask` as an interactive prompt.
+> Cursor renders `ask` on `beforeShellExecution`, but its `preToolUse` surface
+> (which gates `WebFetch`) does not — so AgentGuard downgrades `ask` to a clean
+> **deny** there, with the same reason, attributed to `cursor` in the audit log.
+
+Tune the allowlists in `~/.agentguard/config.json` (user-owned — no sudo). The
+daemon **watches the file and auto-reloads within ~2s** of a save — no rebuild,
+no restart, no command. (A malformed edit is logged and ignored, keeping the
+last good policy.) `make service-reload` forces an immediate reload if needed.
 
 ## Secret detection backends
 

@@ -157,6 +157,29 @@ func TestCursorInstallsPromptScan(t *testing.T) {
 	}
 }
 
+// underCursor detects Cursor-run hooks via the env vars Cursor documents as
+// always present (CURSOR_PROJECT_DIR, CURSOR_VERSION).
+func TestUnderCursor(t *testing.T) {
+	for _, v := range []string{"CURSOR_PROJECT_DIR", "CURSOR_VERSION", "CURSOR_AGENT"} {
+		t.Setenv(v, "")
+		os.Unsetenv(v)
+	}
+	if underCursor() {
+		t.Error("should be false when no Cursor env vars are set")
+	}
+
+	t.Setenv("CURSOR_VERSION", "1.7.2")
+	if !underCursor() {
+		t.Error("should be true when CURSOR_VERSION is set")
+	}
+
+	os.Unsetenv("CURSOR_VERSION")
+	t.Setenv("CURSOR_PROJECT_DIR", "/repo")
+	if !underCursor() {
+		t.Error("should be true when CURSOR_PROJECT_DIR is set")
+	}
+}
+
 // Cursor event translation maps onto the daemon's schema.
 func TestCursorToEvent(t *testing.T) {
 	shell, ok := cursorToEvent(map[string]any{"hook_event_name": "beforeShellExecution", "command": "rm -rf x"})
@@ -169,5 +192,38 @@ func TestCursorToEvent(t *testing.T) {
 	}
 	if _, ok := cursorToEvent(map[string]any{"hook_event_name": "afterAgentThought"}); ok {
 		t.Error("non-gated event should not be gated")
+	}
+}
+
+// preToolUse is the generic gate: it covers tools without a dedicated hook
+// (e.g. WebFetch) and defers Shell/Read to their dedicated hooks.
+func TestCursorPreToolUse(t *testing.T) {
+	fetch, ok := cursorToEvent(map[string]any{
+		"hook_event_name": "preToolUse",
+		"tool_name":       "WebFetch",
+		"tool_input":      map[string]any{"url": "https://example.com"},
+	})
+	if !ok {
+		t.Fatal("WebFetch preToolUse should be gated")
+	}
+	if fetch.ToolName != "WebFetch" || fetch.ToolInput["url"] != "https://example.com" {
+		t.Errorf("WebFetch mapping wrong: %+v", fetch)
+	}
+	if !fetch.ClientCannotAsk {
+		t.Error("preToolUse must set ClientCannotAsk (Cursor can't render ask there)")
+	}
+
+	// Shell and Read are owned by their dedicated hooks — preToolUse defers.
+	for _, tool := range []string{"Shell", "Read"} {
+		if _, ok := cursorToEvent(map[string]any{"hook_event_name": "preToolUse", "tool_name": tool}); ok {
+			t.Errorf("%s preToolUse should defer to its dedicated hook", tool)
+		}
+	}
+}
+
+// preToolUse is registered so Cursor gates all tools natively.
+func TestCursorEventsIncludesPreToolUse(t *testing.T) {
+	if !slices.Contains(cursorEvents, "preToolUse") {
+		t.Error("preToolUse not in cursorEvents")
 	}
 }

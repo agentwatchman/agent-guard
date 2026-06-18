@@ -23,6 +23,12 @@ type HookEvent struct {
 	ToolName  string         `json:"tool_name"`  // "Bash", "Read", "Edit", "Write", "mcp__<server>__<tool>"
 	ToolInput map[string]any `json:"tool_input"` // shape varies by tool
 	Agent     string         `json:"agent,omitempty"`
+	// ClientCannotAsk is set by a hook handler when the calling agent's hook
+	// surface cannot render an interactive "ask" prompt (e.g. Cursor's
+	// preToolUse, which gates WebFetch). When true, the daemon downgrades an
+	// "ask" decision to "deny" so the action is cleanly blocked rather than
+	// erroring, and the audit log records what was actually enforced.
+	ClientCannotAsk bool `json:"client_cannot_ask,omitempty"`
 }
 
 // HookResponse is what we return. PermissionDecision is one of allow/deny/ask.

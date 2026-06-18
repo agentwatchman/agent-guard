@@ -227,6 +227,11 @@ func isOurClaudeHook(h map[string]any) bool {
 // ---- Cursor: ~/.cursor/hooks.json ------------------------------------------
 
 // cursorEvents are the hook surfaces we gate. We map cleanly onto these:
+//   - preToolUse:           generic gate that fires for ALL tools, so it covers
+//     tools without a dedicated hook (WebFetch, Write, Delete, Task, …). Our
+//     handler defers Shell/Read to their richer dedicated hooks below. Note
+//     Cursor's preToolUse accepts but does not enforce "ask", so the daemon
+//     downgrades ask -> deny for it (see ClientCannotAsk).
 //   - beforeShellExecution: shell commands (supports allow/deny/ask)
 //   - beforeReadFile:       secret/credential file reads (allow/deny)
 //   - beforeSubmitPrompt:   ggshield-style scan of the prompt + attached files
@@ -236,7 +241,7 @@ func isOurClaudeHook(h map[string]any) bool {
 // beforeMCPExecution is intentionally NOT wired yet — Cursor's MCP payload
 // doesn't expose the server name our allowlist needs, so gating it would risk
 // false-blocking. Tracked as a follow-up.
-var cursorEvents = []string{"beforeShellExecution", "beforeReadFile", "beforeSubmitPrompt"}
+var cursorEvents = []string{"preToolUse", "beforeShellExecution", "beforeReadFile", "beforeSubmitPrompt"}
 
 func installCursor(path, self string) error {
 	m, err := readJSONObject(path)

@@ -5,6 +5,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"log/slog"
 	"net"
@@ -45,8 +46,11 @@ func (d *Daemon) logger() *slog.Logger {
 // Run starts the daemon on a Unix domain socket. No TCP port means nothing to
 // conflict with another process; only this user can reach it (0600).
 func Run(args []string) {
+	home, _ := os.UserHomeDir()
+	defaultCfg := filepath.Join(home, ".agentguard", "config.json")
+
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	cfgPath := fs.String("config", "config.json", "path to policy config")
+	cfgPath := fs.String("config", defaultCfg, "path to policy config")
 	_ = fs.Parse(args)
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -56,7 +60,6 @@ func Run(args []string) {
 		os.Exit(1)
 	}
 
-	home, _ := os.UserHomeDir()
 	logPath := filepath.Join(home, ".agentguard", "audit.log")
 	_ = os.MkdirAll(filepath.Dir(logPath), 0o755)
 	if l, err := audit.Open(logPath); err != nil {
@@ -86,18 +89,17 @@ func Run(args []string) {
 		os.Exit(0)
 	}()
 
-	// Hot-reload the policy config on SIGHUP (e.g. `make service-reload`) without
-	// dropping the socket. On a bad config we keep the previous one rather than
-	// failing open or crashing.
+	// Hot-reload the policy config two ways, both without dropping the socket:
+	//  - automatically, by watching the file for edits (the common case), and
+	//  - on SIGHUP, for scripted reloads (`make service-reload`).
+	// On a bad config we keep the previous one rather than failing open/crashing.
+	go d.watchConfig(*cfgPath)
+
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 	go func() {
 		for range hup {
-			if err := d.loadConfig(*cfgPath); err != nil {
-				d.logger().Error("config reload failed (keeping previous config)", "err", err)
-			} else {
-				d.logger().Info("config reloaded", "path", *cfgPath)
-			}
+			d.reload(*cfgPath, "SIGHUP")
 		}
 	}()
 
@@ -114,9 +116,10 @@ func Run(args []string) {
 	}
 	logger.Info("AgentGuard daemon started",
 		"socket", sock,
+		"config", *cfgPath,
 		"audit_log", logPath,
 		"scanner", "builtin + kingfisherd (if running)",
-		"reload_signal", "SIGHUP",
+		"reload", "auto (file watch) + SIGHUP",
 	)
 	if err := srv.Serve(ln); err != nil {
 		logger.Error("server stopped", "err", err)
@@ -125,9 +128,20 @@ func Run(args []string) {
 }
 
 // loadConfig reads the policy config from disk and swaps it in under the lock.
+// If the file doesn't exist yet (fresh machine, no installer run), it seeds a
+// sensible default so the daemon is usable out of the box and the user has a
+// file to edit.
 func (d *Daemon) loadConfig(path string) error {
 	b, err := os.ReadFile(path)
-	if err != nil {
+	if errors.Is(err, os.ErrNotExist) {
+		b = defaultConfigJSON()
+		_ = os.MkdirAll(filepath.Dir(path), 0o755)
+		if werr := os.WriteFile(path, b, 0o644); werr != nil {
+			d.logger().Warn("could not seed default config", "path", path, "err", werr)
+		} else {
+			d.logger().Info("seeded default config", "path", path)
+		}
+	} else if err != nil {
 		return err
 	}
 	var c types.Config
@@ -138,6 +152,55 @@ func (d *Daemon) loadConfig(path string) error {
 	d.cfg = c
 	d.cfgMu.Unlock()
 	return nil
+}
+
+// reload re-reads the config, logging the outcome and the trigger. A bad config
+// is logged and ignored so the daemon keeps running on the last good policy.
+func (d *Daemon) reload(path, trigger string) {
+	if err := d.loadConfig(path); err != nil {
+		d.logger().Error("config reload failed (keeping previous config)", "trigger", trigger, "err", err)
+	} else {
+		d.logger().Info("config reloaded", "trigger", trigger, "path", path)
+	}
+}
+
+// watchConfig polls the config file's modification time + size and hot-reloads
+// on any change, so editing the config takes effect within a couple of seconds
+// with no command to run. Polling (vs. fsnotify) keeps us dependency-free and
+// handles editors that save via atomic rename, which would break a file watch.
+func (d *Daemon) watchConfig(path string) {
+	lastMod, lastSize := statSig(path)
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	for range t.C {
+		mod, size := statSig(path)
+		if mod.Equal(lastMod) && size == lastSize {
+			continue
+		}
+		lastMod, lastSize = mod, size
+		d.reload(path, "file-change")
+	}
+}
+
+// statSig returns the file's modification time and size, or zero values if it
+// can't be stat'd (e.g. mid-rename); a transient miss just defers the reload.
+func statSig(path string) (time.Time, int64) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return time.Time{}, 0
+	}
+	return fi.ModTime(), fi.Size()
+}
+
+// defaultConfigJSON is the built-in starter policy used to seed a missing config
+// file. Keep it in sync with the repo's config.json (the installer's copy).
+func defaultConfigJSON() []byte {
+	c := types.Config{
+		AllowedEgress: []string{"github.com", "api.github.com", "registry.npmjs.org", "pypi.org", "files.pythonhosted.org"},
+		ApprovedMCP:   []string{"github", "linear"},
+	}
+	b, _ := json.MarshalIndent(c, "", "  ")
+	return append(b, '\n')
 }
 
 // config returns a snapshot of the current policy config.
@@ -171,6 +234,12 @@ func (d *Daemon) handleEvaluate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := policy.Evaluate(d.config(), e)
+	// Some hook surfaces (e.g. Cursor's preToolUse) can't render an "ask" prompt;
+	// the handler that knows this sets ClientCannotAsk, so we downgrade to a
+	// definitive deny and record the decision we actually enforce.
+	if e.ClientCannotAsk && resp.HookSpecificOutput.PermissionDecision == types.Ask {
+		resp = types.Decide(types.Deny, resp.HookSpecificOutput.PermissionDecisionReason)
+	}
 	d.met.recordEvaluate(resp.HookSpecificOutput.PermissionDecision)
 	d.audit.Evaluate(e, resp)
 

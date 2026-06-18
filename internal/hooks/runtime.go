@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"agentguard/internal/types"
@@ -19,6 +20,37 @@ const (
 	agentClaude = "claude-code"
 	agentCursor = "cursor"
 )
+
+// underCursor reports whether this hook process is being executed by Cursor.
+// Cursor reuses the Claude-format PreToolUse hook for tools it has no native
+// hook for (e.g. WebFetch), so the claude-hook handler uses this to fix
+// attribution and adapt to Cursor's preToolUse surface, which per Cursor's docs
+// accepts but does not enforce an "ask" decision.
+//
+// Detection keys on the env vars Cursor documents as always present for the
+// hooks it runs (CURSOR_PROJECT_DIR, CURSOR_VERSION); real Claude Code does not
+// set these. CURSOR_AGENT is also checked as an observed fallback.
+func underCursor() bool {
+	return os.Getenv("CURSOR_PROJECT_DIR") != "" ||
+		os.Getenv("CURSOR_VERSION") != "" ||
+		os.Getenv("CURSOR_AGENT") != ""
+}
+
+// cursorHooksActive reports whether our native Cursor hooks are installed, so
+// the Claude-compatibility handler can safely defer to them under Cursor rather
+// than double-enforcing. If they're absent, the claude-hook keeps enforcing so
+// there's never a coverage gap.
+func cursorHooksActive() bool {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false
+	}
+	b, err := os.ReadFile(cursorHooksPath(home))
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(b), cursorMarker)
+}
 
 // socketURL/socketScanURL are dummy URLs; the transport dials the Unix socket,
 // so the host is ignored. The path must match the daemon's mux route.
@@ -48,6 +80,18 @@ func ClaudeHook() {
 		Prompt        string `json:"prompt"`
 	}
 	_ = json.Unmarshal(data, &probe)
+
+	// Cursor also runs this Claude-compatibility hook alongside its own native
+	// hooks. When our native Cursor hooks are installed, defer to them so a tool
+	// call isn't evaluated (and audited) twice. (Allow shape: empty for
+	// UserPromptSubmit, an explicit allow decision for PreToolUse.)
+	if underCursor() && cursorHooksActive() {
+		if probe.HookEventName != "UserPromptSubmit" {
+			_ = json.NewEncoder(os.Stdout).Encode(types.Decide(types.Allow, ""))
+		}
+		return
+	}
+
 	if probe.HookEventName == "UserPromptSubmit" {
 		claudePromptScan(probe.Prompt)
 		return
@@ -60,6 +104,14 @@ func ClaudeHook() {
 		return
 	}
 	e.Agent = agentClaude
+	if underCursor() {
+		// Fallback for Cursor without our native hooks installed: attribute to
+		// Cursor and flag that its preToolUse surface can't render "ask" (the
+		// daemon then downgrades ask -> deny). The deferral above handles the
+		// normal case where native hooks own enforcement.
+		e.Agent = agentCursor
+		e.ClientCannotAsk = true
+	}
 	resp, err := postEvaluate(e)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "agentguard claude-hook: daemon unreachable:", err)
@@ -190,6 +242,18 @@ func cursorToEvent(in map[string]any) (types.HookEvent, bool) {
 	case "beforeReadFile":
 		fp, _ := in["file_path"].(string)
 		return types.HookEvent{ToolName: "Read", CWD: cwd, ToolInput: map[string]any{"file_path": fp}}, true
+	case "preToolUse":
+		// Generic gate for every tool. Shell and Read have dedicated hooks above
+		// (beforeShellExecution supports "ask"; beforeReadFile gates reads), so
+		// defer those to avoid double-gating; cover everything else (WebFetch,
+		// Write, Delete, Task, …) here. preToolUse can't render "ask", so flag
+		// the event for the daemon to downgrade ask -> deny.
+		toolName, _ := in["tool_name"].(string)
+		if toolName == "" || toolName == "Shell" || toolName == "Read" {
+			return types.HookEvent{}, false
+		}
+		ti, _ := in["tool_input"].(map[string]any)
+		return types.HookEvent{ToolName: toolName, CWD: cwd, ToolInput: ti, ClientCannotAsk: true}, true
 	}
 
 	// Fallback inference if hook_event_name is absent.

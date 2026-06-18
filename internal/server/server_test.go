@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -47,6 +49,38 @@ func TestHandleEvaluate(t *testing.T) {
 	}
 }
 
+func TestClientCannotAskDowngradesToDeny(t *testing.T) {
+	d := testDaemon()
+
+	// Off-allowlist WebFetch normally yields "ask".
+	asked := do(d.handleEvaluate, `{"tool_name":"WebFetch","tool_input":{"url":"https://example.com"}}`)
+	var a types.HookResponse
+	_ = json.Unmarshal(asked.Body.Bytes(), &a)
+	if a.HookSpecificOutput.PermissionDecision != types.Ask {
+		t.Fatalf("baseline: got %q want ask", a.HookSpecificOutput.PermissionDecision)
+	}
+
+	// Same call from a client that can't render "ask" -> downgraded to deny,
+	// reason preserved.
+	denied := do(d.handleEvaluate, `{"tool_name":"WebFetch","tool_input":{"url":"https://example.com"},"client_cannot_ask":true}`)
+	var dn types.HookResponse
+	_ = json.Unmarshal(denied.Body.Bytes(), &dn)
+	if dn.HookSpecificOutput.PermissionDecision != types.Deny {
+		t.Errorf("downgrade: got %q want deny", dn.HookSpecificOutput.PermissionDecision)
+	}
+	if dn.HookSpecificOutput.PermissionDecisionReason == "" {
+		t.Error("downgrade should keep the original reason")
+	}
+
+	// A would-be "allow" is unaffected by the flag.
+	allowed := do(d.handleEvaluate, `{"tool_name":"WebFetch","tool_input":{"url":"https://api.github.com"},"client_cannot_ask":true}`)
+	var al types.HookResponse
+	_ = json.Unmarshal(allowed.Body.Bytes(), &al)
+	if al.HookSpecificOutput.PermissionDecision != types.Allow {
+		t.Errorf("allow with flag: got %q want allow", al.HookSpecificOutput.PermissionDecision)
+	}
+}
+
 func TestHandleScan(t *testing.T) {
 	d := testDaemon()
 
@@ -75,6 +109,62 @@ func TestBodyCapRejected(t *testing.T) {
 	rec := do(d.handleScan, `{"text":"`+big+`"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("oversized body: got %d want %d", rec.Code, http.StatusBadRequest)
+	}
+}
+
+func TestLoadConfigSeedsDefault(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sub", "config.json")
+	d := &Daemon{}
+	if err := d.loadConfig(path); err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected config to be seeded on disk: %v", err)
+	}
+	if len(d.config().AllowedEgress) == 0 {
+		t.Error("seeded config should have a non-empty allowed_egress")
+	}
+}
+
+func TestReloadPicksUpEdit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"allowed_egress":["github.com"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d := &Daemon{}
+	if err := d.loadConfig(path); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(path, []byte(`{"allowed_egress":["example.com"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d.reload(path, "test")
+
+	got := d.config().AllowedEgress
+	if len(got) != 1 || got[0] != "example.com" {
+		t.Errorf("reload didn't swap config: got %v", got)
+	}
+}
+
+func TestReloadKeepsPreviousOnBadConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"allowed_egress":["github.com"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d := &Daemon{}
+	if err := d.loadConfig(path); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(path, []byte(`{ this is not json`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d.reload(path, "test") // should log + ignore, not panic or wipe config
+
+	got := d.config().AllowedEgress
+	if len(got) != 1 || got[0] != "github.com" {
+		t.Errorf("bad config should keep previous: got %v", got)
 	}
 }
 

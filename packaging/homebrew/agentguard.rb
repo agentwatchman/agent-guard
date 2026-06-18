@@ -29,15 +29,14 @@ class Agentguard < Formula
   def install
     # Compiles the cmd/agentguard entry point into `agentguard`.
     system "go", "build", *std_go_args(ldflags: "-s -w"), "./cmd/agentguard"
-
-    # Install the default policy config without clobbering a user's edits on
-    # upgrade (Homebrew preserves files written into `etc`).
-    (etc/"agentguard").install "config.json" unless (etc/"agentguard/config.json").exist?
   end
 
   # `brew services start agentguard` runs this as a background launchd agent.
+  # No --config: the daemon defaults to ~/.agentguard/config.json (user-owned,
+  # no sudo to edit) and seeds a default there on first run, then auto-reloads
+  # it on change.
   service do
-    run [opt_bin/"agentguard", "--config", etc/"agentguard/config.json"]
+    run [opt_bin/"agentguard"]
     keep_alive true
     run_type :immediate
     log_path var/"log/agentguard.log"
@@ -61,7 +60,7 @@ class Agentguard < Formula
       port — and writes a redacted audit log to ~/.agentguard/audit.log. Tune
       allowlists in:
 
-        #{etc}/agentguard/config.json   (then: brew services restart agentguard)
+        ~/.agentguard/config.json   (the daemon auto-reloads it within ~2s — no restart)
 
       To remove the agent hooks later:  agentguard uninstall-hooks
     EOS
@@ -71,7 +70,9 @@ class Agentguard < Formula
     # Bring up the daemon on a test socket; the claude-hook handler should reach
     # it and deny a secret read.
     sock = testpath/"ag.sock"
-    pid = spawn({ "AGENTGUARD_SOCKET" => sock.to_s }, bin/"agentguard", "--config", etc/"agentguard/config.json")
+    cfg = testpath/"config.json"
+    cfg.write '{"allowed_egress":[],"approved_mcp":[]}'
+    pid = spawn({ "AGENTGUARD_SOCKET" => sock.to_s }, bin/"agentguard", "--config", cfg.to_s)
     sleep 1
     begin
       out = pipe_output(
