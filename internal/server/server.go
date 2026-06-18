@@ -111,10 +111,26 @@ func (d *Daemon) config() types.Config {
 	return d.cfg
 }
 
+// maxRequestBytes caps the size of a hook/scan request body. Hook events are
+// tiny and even a large prompt is well under this; the limit just stops a
+// malformed or hostile client from forcing the daemon to buffer unbounded input.
+const maxRequestBytes = 1 << 20 // 1 MiB
+
+// decodeJSON reads a size-capped request body into dst, replying 400 on any
+// error (malformed JSON or a body over maxRequestBytes). Returns false if the
+// caller should stop.
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return false
+	}
+	return true
+}
+
 func (d *Daemon) handleEvaluate(w http.ResponseWriter, r *http.Request) {
 	var e types.HookEvent
-	if err := json.NewDecoder(r.Body).Decode(&e); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
+	if !decodeJSON(w, r, &e) {
 		return
 	}
 
@@ -127,8 +143,7 @@ func (d *Daemon) handleEvaluate(w http.ResponseWriter, r *http.Request) {
 
 func (d *Daemon) handleScan(w http.ResponseWriter, r *http.Request) {
 	var req types.ScanRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	// scan.ScanAll runs the always-on builtin scanner plus the resident
