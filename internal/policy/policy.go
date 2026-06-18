@@ -48,49 +48,126 @@ func extract(e types.HookEvent) (cmd, filePath, mcpServer, fetchURL string) {
 	return
 }
 
-// Evaluate runs the policy. Order matters: highest-severity first.
-func Evaluate(cfg types.Config, e types.HookEvent) types.HookResponse {
+// signals are the parsed inputs a rule reasons over — computed once per event so
+// rules stay cheap and declarative.
+type signals struct {
+	cfg         types.Config
+	cmd         string
+	mcpServer   string
+	fetchURL    string
+	readsSecret bool
+	touchesNet  bool
+}
+
+// rule is one policy check. Each has a stable id (for audit attribution and the
+// disabled_rules toggle) and a severity. Rules are evaluated in order and the
+// FIRST match wins, so higher-severity / more-specific rules come first.
+type rule struct {
+	id       string
+	severity string
+	eval     func(s signals) (types.HookResponse, bool)
+}
+
+// rules is the ordered policy pipeline. To add a check, append a rule — no need
+// to touch Evaluate. Order encodes precedence (most severe first).
+var rules = []rule{
+	{
+		id: "secret-network-exfiltration", severity: "critical",
+		eval: func(s signals) (types.HookResponse, bool) {
+			if s.readsSecret && s.touchesNet {
+				return types.Decide(types.Deny, "Reads a secret and sends it over the network (exfiltration pattern)."), true
+			}
+			return types.HookResponse{}, false
+		},
+	},
+	{
+		id: "secret-access", severity: "high",
+		eval: func(s signals) (types.HookResponse, bool) {
+			if s.readsSecret {
+				return types.Decide(types.Deny, "Access to secrets/credentials is not permitted for the agent."), true
+			}
+			return types.HookResponse{}, false
+		},
+	},
+	{
+		// Egress for shell network tools (curl/wget/…). An unresolvable host
+		// fails closed to ask, never allow.
+		id: "egress-shell", severity: "medium",
+		eval: func(s signals) (types.HookResponse, bool) {
+			if s.touchesNet {
+				if host := hostOf(s.cmd); !domainAllowed(host, s.cfg.AllowedEgress) {
+					return types.Decide(types.Ask, "Network call to unapproved domain ("+host+") — needs approval."), true
+				}
+			}
+			return types.HookResponse{}, false
+		},
+	},
+	{
+		// Egress for agent-native fetch tools (WebFetch/…), same allowlist.
+		id: "egress-fetch", severity: "medium",
+		eval: func(s signals) (types.HookResponse, bool) {
+			if s.fetchURL != "" {
+				if host := hostOf(s.fetchURL); !domainAllowed(host, s.cfg.AllowedEgress) {
+					return types.Decide(types.Ask, "Web fetch to unapproved domain ("+host+") — needs approval."), true
+				}
+			}
+			return types.HookResponse{}, false
+		},
+	},
+	{
+		id: "destructive-command", severity: "medium",
+		eval: func(s signals) (types.HookResponse, bool) {
+			if destructive.MatchString(s.cmd) {
+				return types.Decide(types.Ask, "Destructive command detected — confirm before running."), true
+			}
+			return types.HookResponse{}, false
+		},
+	},
+	{
+		id: "unapproved-mcp", severity: "high",
+		eval: func(s signals) (types.HookResponse, bool) {
+			if s.mcpServer != "" && !contains(s.cfg.ApprovedMCP, s.mcpServer) {
+				return types.Decide(types.Deny, "MCP server '"+s.mcpServer+"' is not on the approved list."), true
+			}
+			return types.HookResponse{}, false
+		},
+	},
+}
+
+// Decision is the full result of evaluating an event: the response plus which
+// rule produced it (for the audit log / dashboards). RuleID/Severity are empty
+// when nothing matched (allow).
+type Decision struct {
+	Response types.HookResponse
+	RuleID   string
+	Severity string
+}
+
+// EvaluateDetailed runs the policy pipeline and reports which rule fired.
+func EvaluateDetailed(cfg types.Config, e types.HookEvent) Decision {
 	cmd, filePath, mcpServer, fetchURL := extract(e)
-
-	readsSecret := scan.IsSecretPath(filePath) || (cmd != "" && scan.IsSecretPath(cmd))
-	touchesNet := netExfil.MatchString(cmd)
-
-	// 1) Highest-confidence hijack: read a secret AND push it over the network.
-	if readsSecret && touchesNet {
-		return types.Decide(types.Deny, "Reads a secret and sends it over the network (exfiltration pattern).")
+	s := signals{
+		cfg:         cfg,
+		cmd:         cmd,
+		mcpServer:   mcpServer,
+		fetchURL:    fetchURL,
+		readsSecret: scan.IsSecretPath(filePath) || (cmd != "" && scan.IsSecretPath(cmd)),
+		touchesNet:  netExfil.MatchString(cmd),
 	}
-
-	// 2) Any access to secret material.
-	if readsSecret {
-		return types.Decide(types.Deny, "Access to secrets/credentials is not permitted for the agent.")
-	}
-
-	// 3) Egress control — outbound network must target an approved domain. This
-	// covers both shell network tools (curl/wget/…) and agent-native fetch tools
-	// (WebFetch/…) under the SAME allowlist. An unresolvable host fails closed to
-	// ask, never allow.
-	if touchesNet {
-		if host := hostOf(cmd); !domainAllowed(host, cfg.AllowedEgress) {
-			return types.Decide(types.Ask, "Network call to unapproved domain ("+host+") — needs approval.")
+	for _, r := range rules {
+		if contains(cfg.DisabledRules, r.id) {
+			continue
+		}
+		if resp, matched := r.eval(s); matched {
+			return Decision{Response: resp, RuleID: r.id, Severity: r.severity}
 		}
 	}
-	if fetchURL != "" {
-		if host := hostOf(fetchURL); !domainAllowed(host, cfg.AllowedEgress) {
-			return types.Decide(types.Ask, "Web fetch to unapproved domain ("+host+") — needs approval.")
-		}
-	}
+	return Decision{Response: types.Decide(types.Allow, "")}
+}
 
-	// 4) Destructive actions — require explicit confirmation.
-	if destructive.MatchString(cmd) {
-		return types.Decide(types.Ask, "Destructive command detected — confirm before running.")
-	}
-
-	// 5) MCP vetting — only approved servers.
-	if mcpServer != "" && !contains(cfg.ApprovedMCP, mcpServer) {
-		return types.Decide(types.Deny, "MCP server '"+mcpServer+"' is not on the approved list.")
-	}
-
-	return types.Decide(types.Allow, "")
+// Evaluate runs the policy and returns just the decision (back-compat helper).
+func Evaluate(cfg types.Config, e types.HookEvent) types.HookResponse {
+	return EvaluateDetailed(cfg, e).Response
 }
 
 // hostOf pulls the hostname out of the first http(s) URL in s, or "" if there

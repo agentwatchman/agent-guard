@@ -41,14 +41,14 @@ func TestInstallClaudeIdempotentAndPreserves(t *testing.T) {
 		t.Errorf("existing setting lost: model=%v", m["model"])
 	}
 	pre := childArray(childObject(m, "hooks"), "PreToolUse")
-	if !claudeHasOurHook(pre) {
+	if !hasOurHook(pre, claudeMarker) {
 		t.Fatal("our hook not present after install")
 	}
 	count := 0
 	for _, e := range pre {
 		em := e.(map[string]any)
 		for _, h := range childArray(em, "hooks") {
-			if isOurClaudeHook(h.(map[string]any)) {
+			if isOurHook(h.(map[string]any), claudeMarker) {
 				count++
 			}
 		}
@@ -79,7 +79,7 @@ func TestUninstallClaudeRemovesOnlyOurs(t *testing.T) {
 	}
 	m := readBack(t, path)
 	pre := childArray(childObject(m, "hooks"), "PreToolUse")
-	if claudeHasOurHook(pre) {
+	if hasOurHook(pre, claudeMarker) {
 		t.Error("our hook still present after uninstall")
 	}
 	// the user's pre-existing entry must survive
@@ -87,6 +87,72 @@ func TestUninstallClaudeRemovesOnlyOurs(t *testing.T) {
 	for _, e := range pre {
 		em := e.(map[string]any)
 		for _, h := range childArray(em, "hooks") {
+			if c, _ := h.(map[string]any)["command"].(string); c == "echo keep" {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Error("pre-existing user hook was wrongly removed")
+	}
+}
+
+// Codex shares Claude's wire format (~/.codex/hooks.json): install is
+// idempotent across PreToolUse + UserPromptSubmit, preserves unrelated hooks,
+// uses the codex marker (not claude), and uninstall removes only our entries.
+func TestInstallUninstallCodex(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "hooks.json")
+	seed := `{ "hooks": { "PreToolUse": [
+		{ "matcher": "Bash", "hooks": [ { "type": "command", "command": "echo keep" } ] }
+	]}}`
+	if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	self := "/usr/local/bin/agentguard"
+	for i := 0; i < 2; i++ { // idempotent
+		if err := installCodex(path, self); err != nil {
+			t.Fatalf("installCodex run %d: %v", i, err)
+		}
+	}
+
+	m := readBack(t, path)
+	hooks := childObject(m, "hooks")
+	for _, ev := range []string{"PreToolUse", "UserPromptSubmit"} {
+		arr := childArray(hooks, ev)
+		if !hasOurHook(arr, codexMarker) {
+			t.Errorf("event %s missing our codex hook", ev)
+		}
+		// Must use the codex marker, never the claude one.
+		if hasOurHook(arr, claudeMarker) {
+			t.Errorf("event %s wrongly installed a claude-hook", ev)
+		}
+		n := 0
+		for _, e := range arr {
+			for _, h := range childArray(e.(map[string]any), "hooks") {
+				if isOurHook(h.(map[string]any), codexMarker) {
+					n++
+				}
+			}
+		}
+		if n != 1 {
+			t.Errorf("event %s: expected 1 of our hooks, got %d (not idempotent)", ev, n)
+		}
+	}
+
+	if err := uninstallCodex(path); err != nil {
+		t.Fatal(err)
+	}
+	m = readBack(t, path)
+	hooks = childObject(m, "hooks")
+	if hasOurHook(childArray(hooks, "PreToolUse"), codexMarker) {
+		t.Error("our codex hook still present after uninstall")
+	}
+	// The user's pre-existing entry must survive.
+	found := false
+	for _, e := range childArray(hooks, "PreToolUse") {
+		for _, h := range childArray(e.(map[string]any), "hooks") {
 			if c, _ := h.(map[string]any)["command"].(string); c == "echo keep" {
 				found = true
 			}
@@ -225,5 +291,57 @@ func TestCursorPreToolUse(t *testing.T) {
 func TestCursorEventsIncludesPreToolUse(t *testing.T) {
 	if !slices.Contains(cursorEvents, "preToolUse") {
 		t.Error("preToolUse not in cursorEvents")
+	}
+}
+
+// Every registered agent is fully specified (no missing wiring), and ids/flags
+// are unique so install flags and audit attribution don't collide.
+func TestAgentRegistryWellFormed(t *testing.T) {
+	if len(agents) == 0 {
+		t.Fatal("agent registry is empty")
+	}
+	names, flags, cmds := map[string]bool{}, map[string]bool{}, map[string]bool{}
+	for _, a := range agents {
+		if a.Name == "" || a.Label == "" || a.Flag == "" || a.HookCmd == "" {
+			t.Errorf("agent %+v has empty identity field", a)
+		}
+		if a.configPath == nil || a.install == nil || a.uninstall == nil || a.run == nil {
+			t.Errorf("agent %q has nil function wiring", a.Name)
+		}
+		if names[a.Name] || flags[a.Flag] || cmds[a.HookCmd] {
+			t.Errorf("agent %q has a duplicate name/flag/hookcmd", a.Name)
+		}
+		names[a.Name], flags[a.Flag], cmds[a.HookCmd] = true, true, true
+	}
+}
+
+// HandlerFor resolves each agent's hook subcommand and rejects unknown ones.
+func TestHandlerFor(t *testing.T) {
+	for _, a := range agents {
+		if _, ok := HandlerFor(a.HookCmd); !ok {
+			t.Errorf("HandlerFor(%q) not resolved", a.HookCmd)
+		}
+	}
+	if _, ok := HandlerFor("nope-hook"); ok {
+		t.Error("HandlerFor returned a handler for an unknown command")
+	}
+}
+
+// selectAgents: no flags -> all agents in auto mode; a flag -> just that agent.
+func TestSelectAgents(t *testing.T) {
+	all, auto, err := selectAgents("install-hooks", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !auto || len(all) != len(agents) {
+		t.Errorf("no flags should select all agents in auto mode, got auto=%v n=%d", auto, len(all))
+	}
+
+	only, auto, err := selectAgents("install-hooks", []string{"--cursor"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if auto || len(only) != 1 || only[0].Flag != "cursor" {
+		t.Errorf("--cursor should select only Cursor (not auto), got auto=%v sel=%+v", auto, only)
 	}
 }

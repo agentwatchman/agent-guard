@@ -19,6 +19,7 @@ import (
 const (
 	agentClaude = "claude-code"
 	agentCursor = "cursor"
+	agentCodex  = "codex"
 )
 
 // underCursor reports whether this hook process is being executed by Cursor.
@@ -73,60 +74,88 @@ func ClaudeHook() {
 		return
 	}
 
-	// UserPromptSubmit scans the prompt for secrets and uses a different output
-	// contract ({decision: block}); PreToolUse is a per-tool decision.
-	var probe struct {
-		HookEventName string `json:"hook_event_name"`
-		Prompt        string `json:"prompt"`
-	}
-	_ = json.Unmarshal(data, &probe)
-
 	// Cursor also runs this Claude-compatibility hook alongside its own native
 	// hooks. When our native Cursor hooks are installed, defer to them so a tool
 	// call isn't evaluated (and audited) twice. (Allow shape: empty for
 	// UserPromptSubmit, an explicit allow decision for PreToolUse.)
 	if underCursor() && cursorHooksActive() {
+		var probe struct {
+			HookEventName string `json:"hook_event_name"`
+		}
+		_ = json.Unmarshal(data, &probe)
 		if probe.HookEventName != "UserPromptSubmit" {
 			_ = json.NewEncoder(os.Stdout).Encode(types.Decide(types.Allow, ""))
 		}
 		return
 	}
 
+	// Normal Claude Code. Fallback for Cursor without our native hooks: attribute
+	// to Cursor and flag that its preToolUse surface can't render "ask" (the
+	// daemon then downgrades ask -> deny).
+	agent, cannotAsk := agentClaude, false
+	if underCursor() {
+		agent, cannotAsk = agentCursor, true
+	}
+	handleClaudeFormat(data, agent, cannotAsk)
+}
+
+// CodexHook is the command Codex spawns on hook events. Codex speaks Claude
+// Code's hook wire format, with one difference: its PreToolUse surface can't
+// render an interactive "ask" (Codex treats "ask" as a failed hook and proceeds
+// with the tool call), so every tool decision is flagged so the daemon
+// downgrades ask -> deny. Fails CLOSED if the daemon is unreachable.
+func CodexHook() {
+	data, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "agentguard codex-hook: read error:", err)
+		_ = json.NewEncoder(os.Stdout).Encode(types.Decide(types.Deny, "AgentGuard could not read the event — failing closed."))
+		return
+	}
+	handleClaudeFormat(data, agentCodex, true)
+}
+
+// handleClaudeFormat processes a payload in Claude Code's hook wire format,
+// shared by Claude Code and Codex: a UserPromptSubmit event scans the prompt for
+// secrets ({decision:block} contract), and any other event is a PreToolUse tool
+// decision (hookSpecificOutput contract). agent is stamped for audit
+// attribution; cannotAsk is set for agents whose PreToolUse can't render "ask"
+// so the daemon downgrades ask -> deny.
+func handleClaudeFormat(data []byte, agent string, cannotAsk bool) {
+	var probe struct {
+		HookEventName string `json:"hook_event_name"`
+		Prompt        string `json:"prompt"`
+	}
+	_ = json.Unmarshal(data, &probe)
+
 	if probe.HookEventName == "UserPromptSubmit" {
-		claudePromptScan(probe.Prompt)
+		promptScanBlock(probe.Prompt, agent)
 		return
 	}
 
 	var e types.HookEvent
 	if err := json.Unmarshal(data, &e); err != nil {
-		fmt.Fprintln(os.Stderr, "agentguard claude-hook: bad input:", err)
+		fmt.Fprintln(os.Stderr, "agentguard: bad tool-call input:", err)
 		_ = json.NewEncoder(os.Stdout).Encode(types.Decide(types.Deny, "AgentGuard could not parse the tool call — failing closed."))
 		return
 	}
-	e.Agent = agentClaude
-	if underCursor() {
-		// Fallback for Cursor without our native hooks installed: attribute to
-		// Cursor and flag that its preToolUse surface can't render "ask" (the
-		// daemon then downgrades ask -> deny). The deferral above handles the
-		// normal case where native hooks own enforcement.
-		e.Agent = agentCursor
-		e.ClientCannotAsk = true
-	}
+	e.Agent = agent
+	e.ClientCannotAsk = cannotAsk
 	resp, err := postEvaluate(e)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "agentguard claude-hook: daemon unreachable:", err)
+		fmt.Fprintln(os.Stderr, "agentguard: daemon unreachable:", err)
 		resp = types.Decide(types.Deny, "AgentGuard daemon unreachable — failing closed. Start it: brew services start agentguard")
 	}
 	_ = json.NewEncoder(os.Stdout).Encode(resp)
 }
 
-// claudePromptScan handles Claude Code's UserPromptSubmit: it scans the prompt
-// text for secrets and blocks the submission if any are found. It fails closed
-// (blocks) if the daemon is unreachable, matching the PreToolUse posture.
-func claudePromptScan(prompt string) {
-	res, err := postScan(types.ScanRequest{Text: prompt, Agent: agentClaude})
+// promptScanBlock scans prompt text for secrets and blocks submission if any are
+// found, using the {decision:block} contract shared by Claude Code and Codex.
+// Fails closed (blocks) if the scanner is unreachable; empty output (exit 0)
+// lets the prompt through.
+func promptScanBlock(prompt, agent string) {
+	res, err := postScan(types.ScanRequest{Text: prompt, Agent: agent})
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "agentguard claude-hook: scanner unreachable:", err)
+		fmt.Fprintln(os.Stderr, "agentguard: scanner unreachable:", err)
 		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
 			"decision": "block",
 			"reason":   "AgentGuard: secret scanner unreachable (failing closed).",
@@ -140,7 +169,6 @@ func claudePromptScan(prompt string) {
 		})
 		return
 	}
-	// Allow: no output / exit 0 lets the prompt through.
 }
 
 // ---- cursor-hook runtime handler -------------------------------------------

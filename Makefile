@@ -158,7 +158,7 @@ setup: bootstrap
 	@PATH="$$HOME/.cargo/bin:$(BREW_PREFIX)/bin:$$PATH" $(MAKE) deploy
 
 # --- One command to rule them all ------------------------------------------
-# Builds + installs the daemon, wires up Claude Code / Cursor hooks, and (best
+# Builds + installs the daemon, wires up Claude Code / Cursor / Codex hooks, and (best
 # effort) builds + installs the resident Kingfisher scanner. kingfisherd is
 # optional: if the Rust toolchain isn't present the build is skipped and inline
 # scans use the builtin scanner. Prompts for your sudo password once.
@@ -177,7 +177,7 @@ deploy: doctor install
 	@echo "================================================================"
 	@echo " AgentGuard is deployed and running."
 	@echo "   daemon:   $(PREFIX)/bin/agentguard  (launchd: $(LABEL))"
-	@echo "   hooks:    Claude Code + Cursor wired"
+	@echo "   hooks:    Claude Code / Cursor / Codex (detected agents wired — see above)"
 	@echo "   inline:   kingfisherd if present, else builtin scanner"
 	@echo "================================================================"
 

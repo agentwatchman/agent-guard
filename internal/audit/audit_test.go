@@ -32,15 +32,16 @@ func TestRecordShape(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Evaluate with no agent → "agent" must be omitted.
+	// Evaluate with no agent → "agent" must be omitted; rule/severity surfaced.
 	l.Evaluate(types.HookEvent{ToolName: "Read", SessionID: "s1"},
-		types.Decide(types.Deny, "no secrets for you"))
+		types.Decide(types.Deny, "no secrets for you"), "secret-access", "high")
 	// Scan with agent + multiple findings.
 	l.Scan(types.ScanResult{
 		Found:    true,
 		Reason:   "2 secrets detected",
 		Source:   "builtin",
 		Rule:     "AWS access key id",
+		Severity: "critical",
 		Findings: []types.Finding{{Source: "builtin", Rule: "AWS access key id"}, {Source: "kingfisher", Rule: "GitLab Private Token"}},
 	}, "cursor")
 	l.Close()
@@ -57,7 +58,10 @@ func TestRecordShape(t *testing.T) {
 	if eval["tool"] != "Read" || eval["decision"] != "deny" || eval["session"] != "s1" {
 		t.Errorf("evaluate record wrong: %v", eval)
 	}
-	for _, k := range []string{"agent", "source", "rule", "findings"} {
+	if eval["rule"] != "secret-access" || eval["severity"] != "high" {
+		t.Errorf("evaluate record rule/severity wrong: %v", eval)
+	}
+	for _, k := range []string{"agent", "source", "findings"} {
 		if _, ok := eval[k]; ok {
 			t.Errorf("evaluate record should omit %q, got %v", k, eval[k])
 		}
@@ -70,8 +74,8 @@ func TestRecordShape(t *testing.T) {
 	if scan["tool"] != "Prompt" || scan["decision"] != "deny" || scan["agent"] != "cursor" {
 		t.Errorf("scan record wrong: %v", scan)
 	}
-	if scan["source"] != "builtin" || scan["rule"] != "AWS access key id" {
-		t.Errorf("scan source/rule wrong: %v", scan)
+	if scan["source"] != "builtin" || scan["rule"] != "AWS access key id" || scan["severity"] != "critical" {
+		t.Errorf("scan source/rule/severity wrong: %v", scan)
 	}
 	if fs, ok := scan["findings"].([]any); !ok || len(fs) != 2 {
 		t.Errorf("expected 2 findings, got %v", scan["findings"])

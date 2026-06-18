@@ -50,8 +50,10 @@ func Decide(decision, reason string) HookResponse {
 // Config is the per-team policy, loaded from config.json so it can be tuned
 // without rebuilding.
 type Config struct {
-	AllowedEgress []string `json:"allowed_egress"` // domains the agent may reach
-	ApprovedMCP   []string `json:"approved_mcp"`   // MCP servers the agent may call
+	Version       int      `json:"version,omitempty"`        // config schema version (forward-compat)
+	AllowedEgress []string `json:"allowed_egress"`           // domains the agent may reach
+	ApprovedMCP   []string `json:"approved_mcp"`             // MCP servers the agent may call
+	DisabledRules []string `json:"disabled_rules,omitempty"` // policy rule IDs to turn off
 }
 
 // ScanRequest is the body of /v1/scan: free text plus any attachment paths.
@@ -72,12 +74,14 @@ type Finding struct {
 
 // ScanResult reports whether secret material was found and a redacted reason.
 // Source/Rule reflect the FIRST finding (for the block message); Findings lists
-// EVERY secret detected so a multi-secret prompt is fully reported.
+// EVERY secret detected so a multi-secret prompt is fully reported. Severity is
+// the audit/dashboard severity of the detection (uniform with policy decisions).
 type ScanResult struct {
 	Found    bool      `json:"found"`
 	Reason   string    `json:"reason"`
 	Source   string    `json:"source,omitempty"`
 	Rule     string    `json:"rule,omitempty"`
+	Severity string    `json:"severity,omitempty"`
 	Findings []Finding `json:"findings,omitempty"`
 }
 

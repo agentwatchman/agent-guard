@@ -1,8 +1,8 @@
 # AgentGuard — MVP
 
-Local-first runtime guardrails for AI coding agents (Claude Code, Cursor).
+Local-first runtime guardrails for AI coding agents (Claude Code, Cursor, Codex).
 It runs as a small **local daemon** on a **Unix domain socket** (no TCP port to
-conflict with). Both agents are wired via command hooks that send every tool
+conflict with). Agents are wired via command hooks that send every tool
 call to it, and it returns **allow / deny / ask** before the action runs.
 Nothing leaves the machine — evaluation is local, and only a redacted one-line
 record is written to a local audit log.
@@ -13,9 +13,9 @@ parts.
 
 ## Quick start
 
-One command builds everything, installs the background daemon, wires up Claude
-Code + Cursor, and (best effort) builds the resident Kingfisher scanner. Prompts
-for your sudo password once:
+One command builds everything, installs the background daemon, wires up the
+detected agents (Claude Code, Cursor, Codex), and (best effort) builds the
+resident Kingfisher scanner. Prompts for your sudo password once:
 
 ```bash
 make setup              # fresh machine: installs toolchains, then deploys everything
@@ -50,15 +50,17 @@ make run                # starts the daemon on ~/.agentguard/agentguard.sock
 make test               # fires simulated tool-calls and prints decisions
 ```
 
-## Wire up your AI agents (Claude Code + Cursor)
+## Wire up your AI agents (Claude Code + Cursor + Codex)
 
-One command wires both agents to the daemon. It auto-detects which are installed
-and **safely merges** into existing config (backs up to `*.bak`, idempotent):
+One command wires every detected agent to the daemon. It auto-detects which are
+installed and **safely merges** into existing config (backs up to `*.bak`,
+idempotent):
 
 ```bash
-agentguard install-hooks            # both, auto-detected
+agentguard install-hooks            # all detected
 agentguard install-hooks --claude   # Claude Code only
 agentguard install-hooks --cursor   # Cursor only
+agentguard install-hooks --codex    # Codex only
 agentguard uninstall-hooks          # cleanly remove our entries
 ```
 
@@ -72,6 +74,11 @@ agentguard uninstall-hooks          # cleanly remove our entries
   `beforeShellExecution` / `beforeReadFile` (no double-gating). Because Cursor's
   `preToolUse` accepts but doesn't enforce `ask`, AgentGuard downgrades those to
   a clean `deny`.
+- **Codex** (`~/.codex/hooks.json`) gets `PreToolUse` + `UserPromptSubmit`
+  command hooks (`agentguard codex-hook`) with `failClosed`. Codex shares Claude
+  Code's hook wire format, so the same handler logic applies; its `PreToolUse`
+  intercepts Bash, `apply_patch`, and MCP tool calls. Like Cursor's `preToolUse`,
+  Codex can't render `ask`, so AgentGuard downgrades those to a clean `deny`.
 
 The **`beforeSubmitPrompt`** gate is a ggshield-style secret scanner: before a
 prompt is sent, it scans the prompt text and any attached files for secrets and
@@ -121,6 +128,8 @@ private Homebrew tap, manual install, and Linux — is in
 > Cursor renders `ask` on `beforeShellExecution`, but its `preToolUse` surface
 > (which gates `WebFetch`) does not — so AgentGuard downgrades `ask` to a clean
 > **deny** there, with the same reason, attributed to `cursor` in the audit log.
+> Codex's `PreToolUse` likewise can't render `ask`, so it gets the same
+> downgrade, attributed to `codex`.
 
 Tune the allowlists in `~/.agentguard/config.json` (user-owned — no sudo). The
 daemon **watches the file and auto-reloads within ~2s** of a save — no rebuild,

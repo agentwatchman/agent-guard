@@ -233,7 +233,8 @@ func (d *Daemon) handleEvaluate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := policy.Evaluate(d.config(), e)
+	dec := policy.EvaluateDetailed(d.config(), e)
+	resp := dec.Response
 	// Some hook surfaces (e.g. Cursor's preToolUse) can't render an "ask" prompt;
 	// the handler that knows this sets ClientCannotAsk, so we downgrade to a
 	// definitive deny and record the decision we actually enforce.
@@ -241,7 +242,7 @@ func (d *Daemon) handleEvaluate(w http.ResponseWriter, r *http.Request) {
 		resp = types.Decide(types.Deny, resp.HookSpecificOutput.PermissionDecisionReason)
 	}
 	d.met.recordEvaluate(resp.HookSpecificOutput.PermissionDecision)
-	d.audit.Evaluate(e, resp)
+	d.audit.Evaluate(e, resp, dec.RuleID, dec.Severity)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)

@@ -128,7 +128,8 @@ func resultFromFindings(fs []types.Finding) types.ScanResult {
 	if len(fs) > 1 {
 		reason = fmt.Sprintf("%d secrets detected in prompt (%s)", len(fs), strings.Join(rules, ", "))
 	}
-	return types.ScanResult{Found: true, Reason: reason, Source: fs[0].Source, Rule: fs[0].Rule, Findings: fs}
+	// A leaked credential is the highest-severity event AgentGuard catches.
+	return types.ScanResult{Found: true, Reason: reason, Source: fs[0].Source, Rule: fs[0].Rule, Severity: "critical", Findings: fs}
 }
 
 // mergeFindings concatenates builtin + resident findings, deduping by a

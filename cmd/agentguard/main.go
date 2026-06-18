@@ -8,12 +8,13 @@
 // record is written to a local audit log. Pilot build — no cloud, no tenancy.
 //
 // Commands:
-//   agentguard [serve] [--config ...]                 run the daemon (default)
-//   agentguard install-hooks   [--claude] [--cursor]  wire AI agents to the daemon
-//   agentguard uninstall-hooks [--claude] [--cursor]  remove our hook entries
-//   agentguard claude-hook                            Claude Code hook handler (stdin/stdout)
-//   agentguard cursor-hook                            Cursor hook handler (stdin/stdout)
-//   agentguard scan [file|-]                          secret scan (builtin + kingfisherd)
+//   agentguard [serve] [--config ...]                          run the daemon (default)
+//   agentguard install-hooks   [--claude] [--cursor] [--codex]  wire AI agents to the daemon
+//   agentguard uninstall-hooks [--claude] [--cursor] [--codex]  remove our hook entries
+//   agentguard claude-hook                                     Claude Code hook handler (stdin/stdout)
+//   agentguard cursor-hook                                     Cursor hook handler (stdin/stdout)
+//   agentguard codex-hook                                      Codex hook handler (stdin/stdout)
+//   agentguard scan [file|-]                                   secret scan (builtin + kingfisherd)
 //   agentguard version
 package main
 
@@ -48,10 +49,6 @@ func main() {
 		mustRun(hooks.Install(args))
 	case "uninstall-hooks":
 		mustRun(hooks.Uninstall(args))
-	case "claude-hook":
-		hooks.ClaudeHook()
-	case "cursor-hook":
-		hooks.CursorHook()
 	case "scan":
 		cmdScan(args)
 	case "version":
@@ -59,6 +56,12 @@ func main() {
 	case "help":
 		usage(os.Stdout)
 	default:
+		// Per-agent runtime hook handlers (claude-hook, cursor-hook, …) are
+		// resolved from the agent registry rather than enumerated here.
+		if run, ok := hooks.HandlerFor(cmd); ok {
+			run()
+			return
+		}
 		fmt.Fprintf(os.Stderr, "agentguard: unknown command %q\n\n", cmd)
 		usage(os.Stderr)
 		os.Exit(2)
@@ -69,16 +72,17 @@ func usage(w *os.File) {
 	fmt.Fprint(w, `agentguard — runtime guardrails for AI coding agents
 
 Usage:
-  agentguard [serve] [--config path]                run the daemon (default; Unix socket)
-  agentguard install-hooks   [--claude] [--cursor]  wire Claude Code / Cursor to the daemon
-  agentguard uninstall-hooks [--claude] [--cursor]  remove AgentGuard hook entries
-  agentguard claude-hook                            Claude Code hook handler (reads stdin)
-  agentguard cursor-hook                            Cursor hook handler (reads stdin)
-  agentguard scan [file|-]                          secret scan (builtin + kingfisherd); reads file or stdin
+  agentguard [serve] [--config path]                         run the daemon (default; Unix socket)
+  agentguard install-hooks   [--claude] [--cursor] [--codex]  wire Claude Code / Cursor / Codex to the daemon
+  agentguard uninstall-hooks [--claude] [--cursor] [--codex]  remove AgentGuard hook entries
+  agentguard claude-hook                                     Claude Code hook handler (reads stdin)
+  agentguard cursor-hook                                     Cursor hook handler (reads stdin)
+  agentguard codex-hook                                      Codex hook handler (reads stdin)
+  agentguard scan [file|-]                                   secret scan (builtin + kingfisherd); reads file or stdin
   agentguard version
 
-With no --claude/--cursor flag, install-hooks/uninstall-hooks auto-detect which
-agents are installed (~/.claude, ~/.cursor) and configure those.
+With no --claude/--cursor/--codex flag, install-hooks/uninstall-hooks auto-detect
+which agents are installed (~/.claude, ~/.cursor, ~/.codex) and configure those.
 `)
 }
 

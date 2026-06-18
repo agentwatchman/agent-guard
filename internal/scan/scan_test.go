@@ -37,3 +37,13 @@ func TestScan(t *testing.T) {
 		})
 	}
 }
+
+// A detection carries critical severity; a clean result carries none.
+func TestScanSeverity(t *testing.T) {
+	if got := Scan(types.ScanRequest{Text: "AKIAIOSFODNN7EXAMPLE"}); got.Severity != "critical" {
+		t.Errorf("detected secret should be critical, got %q", got.Severity)
+	}
+	if got := Scan(types.ScanRequest{Text: "please refactor the login handler"}); got.Severity != "" {
+		t.Errorf("clean prompt should have no severity, got %q", got.Severity)
+	}
+}

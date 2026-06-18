@@ -36,7 +36,8 @@ type Record struct {
 	Session  string          `json:"session"`
 	Agent    string          `json:"agent,omitempty"`    // "claude-code" or "cursor"
 	Source   string          `json:"source,omitempty"`   // "builtin" or "kingfisher" (first finding)
-	Rule     string          `json:"rule,omitempty"`     // first finding's rule
+	Rule     string          `json:"rule,omitempty"`     // policy rule id (evaluate) or first finding's rule (scan)
+	Severity string          `json:"severity,omitempty"` // severity of the fired policy rule
 	Findings []types.Finding `json:"findings,omitempty"` // every secret detected
 }
 
@@ -132,8 +133,9 @@ func (l *Logger) rotateIfNeeded(incoming int64) {
 	l.size = 0
 }
 
-// Evaluate records a tool-call decision.
-func (l *Logger) Evaluate(e types.HookEvent, resp types.HookResponse) {
+// Evaluate records a tool-call decision. ruleID/severity attribute the decision
+// to the policy rule that produced it (both empty on an allow).
+func (l *Logger) Evaluate(e types.HookEvent, resp types.HookResponse, ruleID, severity string) {
 	l.write(Record{
 		TS:       time.Now().UTC().Format(time.RFC3339),
 		Tool:     e.ToolName,
@@ -141,6 +143,8 @@ func (l *Logger) Evaluate(e types.HookEvent, resp types.HookResponse) {
 		Reason:   resp.HookSpecificOutput.PermissionDecisionReason,
 		Session:  e.SessionID,
 		Agent:    e.Agent,
+		Rule:     ruleID,
+		Severity: severity,
 	})
 }
 
@@ -159,6 +163,7 @@ func (l *Logger) Scan(res types.ScanResult, agent string) {
 		Agent:    agent,
 		Source:   res.Source,
 		Rule:     res.Rule,
+		Severity: res.Severity,
 		Findings: res.Findings,
 	})
 }

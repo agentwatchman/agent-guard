@@ -16,17 +16,19 @@ import (
 const (
 	claudeMarker = "claude-hook"
 	cursorMarker = "cursor-hook"
+	codexMarker  = "codex-hook"
 )
 
 func claudeSettingsPath(home string) string { return filepath.Join(home, ".claude", "settings.json") }
 func cursorHooksPath(home string) string    { return filepath.Join(home, ".cursor", "hooks.json") }
+func codexHooksPath(home string) string     { return filepath.Join(home, ".codex", "hooks.json") }
 
 // ---- install / uninstall commands ------------------------------------------
 
 // Install wires the detected (or flag-selected) agents to the daemon. self is
 // resolved from the running executable.
 func Install(args []string) error {
-	claude, cursor, auto, err := parseAgentFlags("install-hooks", args)
+	sel, auto, err := selectAgents("install-hooks", args)
 	if err != nil {
 		return err
 	}
@@ -40,25 +42,16 @@ func Install(args []string) error {
 	}
 	self, _ = filepath.Abs(self)
 
-	if claude {
-		p := claudeSettingsPath(home)
+	for _, a := range sel {
+		p := a.configPath(home)
 		if auto && !dirExists(filepath.Dir(p)) {
-			fmt.Println("Claude Code not detected (~/.claude missing) — skipping")
-		} else if err := installClaude(p, self); err != nil {
-			return fmt.Errorf("Claude Code: %w", err)
-		} else {
-			fmt.Printf("installed Claude Code hooks (PreToolUse + UserPromptSubmit) -> %s\n", p)
+			fmt.Printf("%s not detected (%s missing) — skipping\n", a.Label, filepath.Dir(p))
+			continue
 		}
-	}
-	if cursor {
-		p := cursorHooksPath(home)
-		if auto && !dirExists(filepath.Dir(p)) {
-			fmt.Println("Cursor not detected (~/.cursor missing) — skipping")
-		} else if err := installCursor(p, self); err != nil {
-			return fmt.Errorf("Cursor: %w", err)
-		} else {
-			fmt.Printf("installed Cursor hooks -> %s\n", p)
+		if err := a.install(p, self); err != nil {
+			return fmt.Errorf("%s: %w", a.Label, err)
 		}
+		fmt.Printf("installed %s %s -> %s\n", a.Label, a.installMsg, p)
 	}
 	fmt.Println("Done. Make sure the daemon is running (brew services start agentguard, or make install).")
 	return nil
@@ -66,7 +59,7 @@ func Install(args []string) error {
 
 // Uninstall removes AgentGuard's hook entries from the selected agents.
 func Uninstall(args []string) error {
-	claude, cursor, auto, err := parseAgentFlags("uninstall-hooks", args)
+	sel, auto, err := selectAgents("uninstall-hooks", args)
 	if err != nil {
 		return err
 	}
@@ -74,53 +67,63 @@ func Uninstall(args []string) error {
 	if err != nil {
 		return err
 	}
-	if claude {
-		p := claudeSettingsPath(home)
+	for _, a := range sel {
+		p := a.configPath(home)
 		if auto && !fileExists(p) {
-			fmt.Println("no Claude Code settings found — skipping")
-		} else if err := uninstallClaude(p); err != nil {
-			return fmt.Errorf("Claude Code: %w", err)
-		} else {
-			fmt.Printf("removed AgentGuard hook from %s\n", p)
+			fmt.Printf("no %s config found — skipping\n", a.Label)
+			continue
 		}
-	}
-	if cursor {
-		p := cursorHooksPath(home)
-		if auto && !fileExists(p) {
-			fmt.Println("no Cursor hooks found — skipping")
-		} else if err := uninstallCursor(p); err != nil {
-			return fmt.Errorf("Cursor: %w", err)
-		} else {
-			fmt.Printf("removed AgentGuard hooks from %s\n", p)
+		if err := a.uninstall(p); err != nil {
+			return fmt.Errorf("%s: %w", a.Label, err)
 		}
+		fmt.Printf("removed AgentGuard hooks from %s\n", p)
 	}
 	return nil
 }
 
-// parseAgentFlags returns which agents to act on. With neither flag set, both
-// are selected in "auto" mode (only configure agents that are actually present).
-func parseAgentFlags(name string, args []string) (claude, cursor, auto bool, err error) {
+// selectAgents resolves which registered agents a command should act on. A flag
+// is registered per agent (--claude, --cursor, …). With no flag set, ALL agents
+// are selected in "auto" mode (callers then only touch agents actually present).
+func selectAgents(name string, args []string) (sel []*Agent, auto bool, err error) {
 	fset := flag.NewFlagSet(name, flag.ContinueOnError)
-	c := fset.Bool("claude", false, "act on Claude Code (~/.claude/settings.json)")
-	cu := fset.Bool("cursor", false, "act on Cursor (~/.cursor/hooks.json)")
+	want := make(map[*Agent]*bool, len(agents))
+	for _, a := range agents {
+		want[a] = fset.Bool(a.Flag, false, "act on "+a.Label+" ("+a.configPath("~")+")")
+	}
 	if err = fset.Parse(args); err != nil {
-		return
+		return nil, false, err
 	}
-	if !*c && !*cu {
-		return true, true, true, nil
+	for _, a := range agents { // registry order, deterministic
+		if *want[a] {
+			sel = append(sel, a)
+		}
 	}
-	return *c, *cu, false, nil
+	if len(sel) == 0 {
+		return agents, true, nil
+	}
+	return sel, false, nil
 }
 
-// ---- Claude Code: ~/.claude/settings.json ----------------------------------
+// ---- Claude-format agents: Claude Code (~/.claude/settings.json) and Codex
+// (~/.codex/hooks.json) ------------------------------------------------------
+//
+// Both agents use the same hook wire format — a top-level "hooks" object keyed
+// by event (PreToolUse, UserPromptSubmit) with matcher groups of command
+// handlers — so the install/uninstall logic is shared and parameterized only by
+// the marker that identifies our entries (claude-hook vs codex-hook).
 
-func installClaude(path, self string) error {
+func installClaude(path, self string) error { return installClaudeFormat(path, self, claudeMarker) }
+func installCodex(path, self string) error  { return installClaudeFormat(path, self, codexMarker) }
+func uninstallClaude(path string) error     { return uninstallClaudeFormat(path, claudeMarker) }
+func uninstallCodex(path string) error      { return uninstallClaudeFormat(path, codexMarker) }
+
+func installClaudeFormat(path, self, marker string) error {
 	m, err := readJSONObject(path)
 	if err != nil {
 		return err
 	}
 	hooks := childObject(m, "hooks")
-	cmd := self + " " + claudeMarker
+	cmd := self + " " + marker
 	entry := func() map[string]any {
 		return map[string]any{"type": "command", "command": cmd, "timeout": 10}
 	}
@@ -128,7 +131,7 @@ func installClaude(path, self string) error {
 	// Strip any existing AgentGuard entry (incl. legacy HTTP ones) then add the
 	// current command hook — idempotent and upgrade-safe.
 	// PreToolUse: gate every tool call (allow/deny/ask).
-	pre := stripClaudeOurs(childArray(hooks, "PreToolUse"))
+	pre := stripOurs(childArray(hooks, "PreToolUse"), marker)
 	pre = append(pre, map[string]any{
 		"matcher": "*",
 		"hooks":   []any{entry()},
@@ -136,9 +139,8 @@ func installClaude(path, self string) error {
 	hooks["PreToolUse"] = pre
 
 	// UserPromptSubmit: scan the prompt text for secrets before it's sent — the
-	// Claude Code analogue of Cursor's beforeSubmitPrompt. (No matcher: this
-	// event isn't tool-scoped.)
-	ups := stripClaudeOurs(childArray(hooks, "UserPromptSubmit"))
+	// analogue of Cursor's beforeSubmitPrompt. (No matcher: not tool-scoped.)
+	ups := stripOurs(childArray(hooks, "UserPromptSubmit"), marker)
 	ups = append(ups, map[string]any{
 		"hooks": []any{entry()},
 	})
@@ -148,7 +150,7 @@ func installClaude(path, self string) error {
 	return writeJSONObjectAtomic(path, m)
 }
 
-func uninstallClaude(path string) error {
+func uninstallClaudeFormat(path, marker string) error {
 	if !fileExists(path) {
 		return nil
 	}
@@ -161,7 +163,7 @@ func uninstallClaude(path string) error {
 		return nil
 	}
 	for _, ev := range []string{"PreToolUse", "UserPromptSubmit"} {
-		kept := stripClaudeOurs(childArray(hooks, ev))
+		kept := stripOurs(childArray(hooks, ev), marker)
 		if len(kept) == 0 {
 			delete(hooks, ev)
 		} else {
@@ -176,9 +178,9 @@ func uninstallClaude(path string) error {
 	return writeJSONObjectAtomic(path, m)
 }
 
-// stripClaudeOurs removes our hooks from each PreToolUse entry, dropping entries
-// that become empty, and preserves everything we don't own.
-func stripClaudeOurs(pre []any) []any {
+// stripOurs removes our hooks (matched by marker) from each event entry,
+// dropping entries that become empty, and preserves everything we don't own.
+func stripOurs(pre []any, marker string) []any {
 	kept := make([]any, 0, len(pre))
 	for _, entry := range pre {
 		em, ok := entry.(map[string]any)
@@ -189,7 +191,7 @@ func stripClaudeOurs(pre []any) []any {
 		inner := childArray(em, "hooks")
 		filtered := make([]any, 0, len(inner))
 		for _, h := range inner {
-			if hm, ok := h.(map[string]any); ok && isOurClaudeHook(hm) {
+			if hm, ok := h.(map[string]any); ok && isOurHook(hm, marker) {
 				continue
 			}
 			filtered = append(filtered, h)
@@ -203,14 +205,14 @@ func stripClaudeOurs(pre []any) []any {
 	return kept
 }
 
-func claudeHasOurHook(pre []any) bool {
+func hasOurHook(pre []any, marker string) bool {
 	for _, entry := range pre {
 		em, ok := entry.(map[string]any)
 		if !ok {
 			continue
 		}
 		for _, h := range childArray(em, "hooks") {
-			if hm, ok := h.(map[string]any); ok && isOurClaudeHook(hm) {
+			if hm, ok := h.(map[string]any); ok && isOurHook(hm, marker) {
 				return true
 			}
 		}
@@ -218,10 +220,10 @@ func claudeHasOurHook(pre []any) bool {
 	return false
 }
 
-func isOurClaudeHook(h map[string]any) bool {
+func isOurHook(h map[string]any, marker string) bool {
 	cmd, _ := h["command"].(string)
 	url, _ := h["url"].(string) // legacy HTTP installs
-	return strings.Contains(cmd, claudeMarker) || strings.Contains(url, "/v1/evaluate")
+	return strings.Contains(cmd, marker) || strings.Contains(url, "/v1/evaluate")
 }
 
 // ---- Cursor: ~/.cursor/hooks.json ------------------------------------------
