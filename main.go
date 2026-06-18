@@ -31,7 +31,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -180,17 +179,7 @@ func cmdScan(args []string) {
 		text = string(b)
 	}
 
-	// Run BOTH backends and merge every finding: the builtin scanner (fast, and
-	// catches high-confidence patterns Kingfisher deliberately suppresses, e.g.
-	// well-known example keys) plus the resident kingfisherd (950+ rules). This
-	// reports all secrets in the input, not just the first. Mirrors handleScan.
-	builtin := Scan(ScanRequest{Text: text})
-	var resident []Finding
-	if rr, err := residentScan(text); err == nil {
-		resident = rr.Findings
-	}
-	res := resultFromFindings(mergeFindings(builtin.Findings, resident))
-	reportScan(res)
+	reportScan(scanAll(ScanRequest{Text: text}))
 }
 
 func reportScan(res ScanResult) {
@@ -243,20 +232,7 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	// The builtin scanner is the always-on baseline: sub-millisecond, reliable,
-	// and it handles the attachment-path check. If kingfisherd (the resident
-	// Kingfisher scanner) is up, we ALSO consult it for its 950+ rules and merge
-	// every finding, so a multi-secret prompt is fully reported. Any resident
-	// error is ignored and we keep the builtin result, so the hot path never
-	// blocks.
-	builtin := Scan(req)
-	var resident []Finding
-	if strings.TrimSpace(req.Text) != "" {
-		if rr, err := residentScan(req.Text); err == nil {
-			resident = rr.Findings
-		}
-	}
-	res := resultFromFindings(mergeFindings(builtin.Findings, resident))
+	res := scanAll(req)
 	writeScanAudit(res, req.Agent)
 
 	w.Header().Set("Content-Type", "application/json")

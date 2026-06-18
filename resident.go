@@ -16,6 +16,25 @@ import (
 // ~4s/call cost of the CLI. If kingfisherd isn't running (or hangs), we fall
 // back to the builtin scanner, so the hot path never blocks.
 
+// scanAll is the single secret-detection entry point shared by the inline hook
+// path (handleScan) and the on-demand CLI (cmdScan). It runs the full union:
+// the always-on builtin scanner (sub-ms; also handles the attachment-path check
+// and catches high-confidence patterns Kingfisher deliberately suppresses, e.g.
+// well-known example keys) plus the resident kingfisherd when there's text to
+// scan and it's reachable. Findings are merged and deduped so multi-secret input
+// is fully reported. A resident error is ignored — the builtin result stands, so
+// the hot path never blocks.
+func scanAll(req ScanRequest) ScanResult {
+	builtin := Scan(req)
+	var resident []Finding
+	if strings.TrimSpace(req.Text) != "" {
+		if rr, err := residentScan(req.Text); err == nil {
+			resident = rr.Findings
+		}
+	}
+	return resultFromFindings(mergeFindings(builtin.Findings, resident))
+}
+
 func residentSocketPath() string {
 	if p := strings.TrimSpace(os.Getenv("AGENTGUARD_KINGFISHERD_SOCKET")); p != "" {
 		return p
