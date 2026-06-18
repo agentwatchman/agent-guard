@@ -22,11 +22,14 @@ import (
 	"agentguard/internal/types"
 )
 
-var (
-	cfg      types.Config
-	cfgMu    sync.RWMutex
-	auditLog *audit.Logger
-)
+// Daemon holds the running daemon's state: the hot-swappable policy config and
+// the audit logger. Bundling it in a struct (rather than package globals) keeps
+// the state explicit, lets handlers be methods, and makes the daemon testable.
+type Daemon struct {
+	cfgMu sync.RWMutex
+	cfg   types.Config
+	audit *audit.Logger
+}
 
 // Run starts the daemon on a Unix domain socket. No TCP port means nothing to
 // conflict with another process; only this user can reach it (0600).
@@ -35,7 +38,8 @@ func Run(args []string) {
 	cfgPath := fs.String("config", "config.json", "path to policy config")
 	_ = fs.Parse(args)
 
-	if err := loadConfig(*cfgPath); err != nil {
+	d := &Daemon{}
+	if err := d.loadConfig(*cfgPath); err != nil {
 		log.Fatalf("failed to load config %s: %v", *cfgPath, err)
 	}
 
@@ -45,8 +49,8 @@ func Run(args []string) {
 	if l, err := audit.Open(logPath); err != nil {
 		log.Printf("warning: could not open audit log: %v", err)
 	} else {
-		auditLog = l
-		defer auditLog.Close()
+		d.audit = l
+		defer d.audit.Close()
 	}
 
 	sock := types.SocketPath()
@@ -69,8 +73,8 @@ func Run(args []string) {
 	}()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/evaluate", handleEvaluate)
-	mux.HandleFunc("/v1/scan", handleScan)
+	mux.HandleFunc("/v1/evaluate", d.handleEvaluate)
+	mux.HandleFunc("/v1/scan", d.handleScan)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 
 	srv := &http.Server{
@@ -84,7 +88,8 @@ func Run(args []string) {
 	log.Fatal(srv.Serve(ln))
 }
 
-func loadConfig(path string) error {
+// loadConfig reads the policy config from disk and swaps it in under the lock.
+func (d *Daemon) loadConfig(path string) error {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -93,31 +98,34 @@ func loadConfig(path string) error {
 	if err := json.Unmarshal(b, &c); err != nil {
 		return err
 	}
-	cfgMu.Lock()
-	cfg = c
-	cfgMu.Unlock()
+	d.cfgMu.Lock()
+	d.cfg = c
+	d.cfgMu.Unlock()
 	return nil
 }
 
-func handleEvaluate(w http.ResponseWriter, r *http.Request) {
+// config returns a snapshot of the current policy config.
+func (d *Daemon) config() types.Config {
+	d.cfgMu.RLock()
+	defer d.cfgMu.RUnlock()
+	return d.cfg
+}
+
+func (d *Daemon) handleEvaluate(w http.ResponseWriter, r *http.Request) {
 	var e types.HookEvent
 	if err := json.NewDecoder(r.Body).Decode(&e); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
 
-	cfgMu.RLock()
-	c := cfg
-	cfgMu.RUnlock()
-
-	resp := policy.Evaluate(c, e)
-	auditLog.Evaluate(e, resp)
+	resp := policy.Evaluate(d.config(), e)
+	d.audit.Evaluate(e, resp)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-func handleScan(w http.ResponseWriter, r *http.Request) {
+func (d *Daemon) handleScan(w http.ResponseWriter, r *http.Request) {
 	var req types.ScanRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -127,7 +135,7 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 	// kingfisherd (if up) and merges every finding, so a multi-secret prompt is
 	// fully reported. A resident error is ignored, so the hot path never blocks.
 	res := scan.ScanAll(req)
-	auditLog.Scan(res, req.Agent)
+	d.audit.Scan(res, req.Agent)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(res)

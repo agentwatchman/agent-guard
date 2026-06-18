@@ -2,7 +2,9 @@
 /bin/
 /dist/
 /agentguard
-/kingfisherd
+# Installed kingfisherd binary (the Rust SOURCE in kingfisherd/ is committed;
+# only the compiled binary is ignored — it builds into kingfisherd/target/).
+/kingfisherd/kingfisherd
 # Rust build artifacts (kingfisherd and any future crates)
 target/
 **/target/
