@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Resident Kingfisher scanner. Compiles 950+ rules once at startup (~4s),
+       then serves millisecond scans over a Unix socket. AgentGuard's daemon
+       consults it inline and falls back to its builtin scanner if it's down. -->
+  <key>Label</key>
+  <string>com.agentguard.kingfisherd</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/kingfisherd</string>
+    <string>--socket</string>
+    <string>SOCKET_PATH</string>
+  </array>
+
+  <!-- start at login -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- restart if it ever exits or crashes -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/kingfisherd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/kingfisherd.err.log</string>
+</dict>
+</plist>

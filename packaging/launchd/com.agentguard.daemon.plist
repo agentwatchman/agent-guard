@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- launchd has no shell, no PATH, no cwd: every path here must be absolute. -->
+  <key>Label</key>
+  <string>com.agentguard.daemon</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/agentguard</string>
+    <string>--config</string>
+    <string>/usr/local/etc/agentguard/config.json</string>
+  </array>
+
+  <!-- start at login -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- restart if it ever exits or crashes (helps the fail-open gap) -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- daemon stdout/stderr; the redacted audit log stays at ~/.agentguard/audit.log -->
+  <key>StandardOutPath</key>
+  <string>/tmp/agentguard.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/agentguard.err.log</string>
+</dict>
+</plist>

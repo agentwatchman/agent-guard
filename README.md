@@ -1,0 +1,200 @@
+# AgentGuard — MVP
+
+Local-first runtime guardrails for AI coding agents (Claude Code, Cursor).
+It runs as a small **local daemon** on a **Unix domain socket** (no TCP port to
+conflict with). Both agents are wired via command hooks that send every tool
+call to it, and it returns **allow / deny / ask** before the action runs.
+Nothing leaves the machine — evaluation is local, and only a redacted one-line
+record is written to a local audit log.
+
+This is the pilot build: **no cloud, no accounts, no multi-tenancy.** The goal
+is to prove value on real machines (e.g. the Fyxer pilot) with the least moving
+parts.
+
+## Quick start
+
+One command builds everything, installs the background daemon, wires up Claude
+Code + Cursor, and (best effort) builds the resident Kingfisher scanner. Prompts
+for your sudo password once:
+
+```bash
+make setup              # fresh machine: installs toolchains, then deploys everything
+```
+
+`make setup` is the do-everything path — it runs `bootstrap` (installs Go, Rust,
+cmake, boost via Homebrew + rustup, skipping anything already present) then
+`deploy`. Use it on a clean machine.
+
+If your toolchains are already installed (CI, provisioned dev box), skip the
+install step and just deploy:
+
+```bash
+make doctor             # (optional) check which toolchains you have
+make deploy             # builds + installs daemon + hooks + kingfisherd (no toolchain install)
+```
+
+`make deploy` runs the `doctor` preflight automatically and is intentionally
+**non-invasive**: it needs **Go** (and sudo) for the daemon and **Rust + cmake +
+boost** only for `kingfisherd`, but it never installs them — `doctor` prints
+exactly what to `brew install` for anything missing. If the Rust toolchain isn't
+present, `kingfisherd` is skipped and inline scans use the builtin scanner (the
+agent still runs); add it later with `make install-kingfisher`.
+
+To poke at the pieces individually:
+
+```bash
+make build              # builds ./bin/agentguard
+make run                # starts the daemon on ~/.agentguard/agentguard.sock
+
+# in another terminal:
+make test               # fires simulated tool-calls and prints decisions
+```
+
+## Wire up your AI agents (Claude Code + Cursor)
+
+One command wires both agents to the daemon. It auto-detects which are installed
+and **safely merges** into existing config (backs up to `*.bak`, idempotent):
+
+```bash
+agentguard install-hooks            # both, auto-detected
+agentguard install-hooks --claude   # Claude Code only
+agentguard install-hooks --cursor   # Cursor only
+agentguard uninstall-hooks          # cleanly remove our entries
+```
+
+- **Claude Code** gets a `PreToolUse` command hook (every tool call is checked)
+  **and** a `UserPromptSubmit` hook (the prompt text is scanned for secrets
+  before it's sent) — both run `agentguard claude-hook`.
+- **Cursor** gets `beforeShellExecution` + `beforeReadFile` +
+  `beforeSubmitPrompt` command hooks (`agentguard cursor-hook`) with
+  `failClosed: true`.
+
+The **`beforeSubmitPrompt`** gate is a ggshield-style secret scanner: before a
+prompt is sent, it scans the prompt text and any attached files for secrets and
+**blocks submission** if it finds them. This catches secrets that reach the
+model's context outside the agent's read path (e.g. an open/attached `.env`),
+which per-tool read hooks can't see in Cursor.
+
+Both agents talk to the same daemon over the socket — one policy engine, one
+audit log — and both **fail closed** (block) if the daemon is unreachable.
+
+With the daemon running, both agents block or prompt on risky actions
+automatically. (`make install` runs `install-hooks` for you.)
+
+> Note: hook schemas evolve — verify against
+> https://code.claude.com/docs/en/hooks and https://cursor.com/docs/agent/hooks
+> before a wide rollout. Full distribution guide: [`packaging/README.md`](packaging/README.md).
+
+## Run in the background (no terminal open)
+
+Don't make developers babysit a terminal. Install the daemon as a background
+service that starts at login and auto-restarts:
+
+```bash
+make install            # build + install + register launchd agent (macOS)
+make service-status     # check it's running
+make uninstall          # remove it
+```
+
+Or via Homebrew (`brew services start agentguard`). Full distribution guide —
+private Homebrew tap, manual install, and Linux — is in
+[`packaging/README.md`](packaging/README.md).
+
+## What it blocks (Tier 1 rules)
+
+| Scenario | Decision |
+|---|---|
+| Reads a secret **and** sends it over the network (`.env`, keys) | **deny** |
+| Any read of `.env` / `~/.aws` / `~/.ssh` / `*.pem` / credentials | **deny** |
+| Prompt (or attached file) containing secrets — Cursor `beforeSubmitPrompt` | **block** |
+| Network call (`curl`/`wget`/…) to a domain not in `allowed_egress` | **ask** |
+| Destructive command (`rm -rf`, `git push --force`, `DROP TABLE`…) | **ask** |
+| Call to an MCP server not in `approved_mcp` | **deny** |
+| Everything else | **allow** |
+
+Tune the allowlists in `config.json` — no rebuild needed (restart the daemon).
+
+## Secret detection backends
+
+There are two scan paths, deliberately split by latency:
+
+**Inline (the hooks)** — the **built-in** regex+entropy scanner is the always-on
+baseline (sub-millisecond, never blocks). If the optional **`kingfisherd`**
+resident scanner is running, inline scans *also* consult it for Kingfisher's
+950+ rules — fast, because it compiles them once at startup (see below). If
+kingfisherd is down or slow, we silently fall back to the builtin result, so the
+hot path never blocks.
+
+### Optional: kingfisherd (Kingfisher coverage, inline)
+
+The Kingfisher CLI recompiles its 950 rules on every call (~4s) — unusable for a
+blocking hook. `kingfisherd` (in `kingfisherd/`, a small Rust service built on
+Kingfisher's library crates) pays that cost **once** at startup and then answers
+scans in milliseconds over a Unix socket. AgentGuard auto-detects it.
+
+```bash
+brew install cmake boost                         # Vectorscan build deps
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # Rust toolchain (>= 1.94)
+source "$HOME/.cargo/env"
+make install-kingfisher                          # build + run as a launchd service
+```
+
+> If you installed Rust via `brew install rustup` instead, note the Homebrew
+> formula no longer ships `rustup-init` and is keg-only — run
+> `export PATH="/opt/homebrew/opt/rustup/bin:$PATH" && rustup default stable`.
+
+Once it's up, the daemon log shows resident hits via the Kingfisher rule name in
+the audit reason. No secret leaves the machine — kingfisherd never enables
+validation.
+
+**On-demand deep scan** — `agentguard scan [file|-]` uses
+[Kingfisher](https://github.com/mongodb/kingfisher) (950+ maintained rules,
+offline checksum validation) when it's installed, else the built-in scanner. Use
+it for CI, pre-commit, or manual audits where its ~4s/call cost is fine:
+
+```bash
+brew install kingfisher
+cat suspicious.txt | agentguard scan -      # exit 0 = clean, 200 = secret found
+agentguard scan ./path/to/file
+```
+
+> Kingfisher is **not** used inline: it recompiles its 950 rules on every
+> invocation (~4s), far too slow for a blocking hook. The deep-scan command
+> always runs it with `--no-validate`, so **no secret is sent to a third-party
+> API** — detection stays local. The `"scanner"` / `"kingfisher_path"` keys in
+> `config.json` select the backend for `agentguard scan` (`auto` / `builtin` /
+> `kingfisher`).
+
+## Audit log
+
+Redacted, append-only, one JSON object per line:
+
+```
+~/.agentguard/audit.log
+```
+
+Each record holds timestamp, tool, decision, and reason — **never** the raw
+command, file contents, or secret values. Prompt-scan records also carry the
+originating `agent` (`claude-code`/`cursor`) and a `findings` list naming **every**
+secret detected (each with its `source` — `builtin` or `kingfisher` — and `rule`),
+so a multi-secret prompt is fully attributed:
+
+```json
+{"ts":"…","tool":"Prompt","agent":"cursor","decision":"deny",
+ "reason":"2 secrets detected in prompt (AWS access key id, GitLab Private Token)",
+ "source":"builtin","rule":"AWS access key id",
+ "findings":[{"source":"builtin","rule":"AWS access key id"},
+             {"source":"kingfisher","rule":"GitLab Private Token"}]}
+```
+
+## What's next (post-pilot)
+
+- Local **secret redactor** + background **policy sync** from a cloud control
+  plane (the privacy-preserving architecture).
+- **Dashboard** for fleet-wide policy + audit visibility.
+- **Tier 2+ detection** (classifier / behavioral / taint) behind the same
+  `Evaluate()` interface.
+- Packaging: signed/notarized prebuilt binaries + MDM (Jamf, Intune) for
+  one-command fleet rollout. (Local build-from-source path already in
+  `packaging/`.)
+

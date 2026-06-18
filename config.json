@@ -1,0 +1,14 @@
+{
+  "allowed_egress": [
+    "github.com",
+    "api.github.com",
+    "registry.npmjs.org",
+    "pypi.org",
+    "files.pythonhosted.org"
+  ],
+  "approved_mcp": [
+    "github",
+    "linear"
+  ],
+  "scanner": "auto"
+}

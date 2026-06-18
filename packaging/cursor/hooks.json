@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "hooks": {
+    "beforeShellExecution": [
+      { "command": "/usr/local/bin/agentguard cursor-hook", "failClosed": true }
+    ],
+    "beforeReadFile": [
+      { "command": "/usr/local/bin/agentguard cursor-hook", "failClosed": true }
+    ],
+    "beforeSubmitPrompt": [
+      { "command": "/usr/local/bin/agentguard cursor-hook", "failClosed": true }
+    ]
+  }
+}

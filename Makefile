@@ -1,0 +1,223 @@
+.PHONY: build run test release clean install uninstall deploy setup bootstrap doctor purge service-restart service-status \
+        build-kingfisher install-kingfisher uninstall-kingfisher
+
+# Where the manual (non-Homebrew) install puts things. Override with: make install PREFIX=/opt
+PREFIX ?= /usr/local
+LABEL   = com.agentguard.daemon
+PLIST   = $(HOME)/Library/LaunchAgents/$(LABEL).plist
+
+# Resident Kingfisher scanner (optional; gives inline scans the full rule set).
+KFLABEL  = com.agentguard.kingfisherd
+KFPLIST  = $(HOME)/Library/LaunchAgents/$(KFLABEL).plist
+KFSOCKET = $(HOME)/.agentguard/kingfisherd.sock
+
+# Local build
+build:
+	go build -o bin/agentguard .
+
+# Run the daemon with the example config
+run: build
+	./bin/agentguard --config config.json
+
+# Run the smoke test (daemon must already be running)
+test:
+	chmod +x test.sh && ./test.sh
+
+# Cross-compile signed-ready binaries for the platforms Fyxer's devs use.
+# (Signing/notarization happens in your release pipeline, not here.)
+release:
+	GOOS=darwin  GOARCH=arm64 go build -o dist/agentguard-darwin-arm64 .
+	GOOS=darwin  GOARCH=amd64 go build -o dist/agentguard-darwin-amd64 .
+	GOOS=linux   GOARCH=amd64 go build -o dist/agentguard-linux-amd64 .
+	GOOS=windows GOARCH=amd64 go build -o dist/agentguard-windows-amd64.exe .
+
+# --- Manual install path (no Homebrew) -------------------------------------
+# Installs the binary + config to $(PREFIX), then registers a launchd LaunchAgent
+# so the daemon runs in the background at login. macOS only.
+install: build
+	sudo install -d "$(PREFIX)/bin" "$(PREFIX)/etc/agentguard"
+	sudo install -m 0755 bin/agentguard "$(PREFIX)/bin/agentguard"
+	@[ -f "$(PREFIX)/etc/agentguard/config.json" ] \
+		&& echo "keeping existing $(PREFIX)/etc/agentguard/config.json" \
+		|| sudo install -m 0644 config.json "$(PREFIX)/etc/agentguard/config.json"
+	mkdir -p "$(HOME)/Library/LaunchAgents"
+	sed -e 's#/usr/local/bin/agentguard#$(PREFIX)/bin/agentguard#' \
+	    -e 's#/usr/local/etc/agentguard/config.json#$(PREFIX)/etc/agentguard/config.json#' \
+	    packaging/launchd/$(LABEL).plist > "$(PLIST)"
+	@# Robustly (re)load: clear any prior registration via BOTH the modern
+	@# (bootout) and legacy (unload/remove) APIs first, otherwise a half-
+	@# registered label makes bootstrap fail with "5: Input/output error".
+	@launchctl bootout gui/$$(id -u)/$(LABEL) 2>/dev/null; \
+	 launchctl bootout gui/$$(id -u) "$(PLIST)" 2>/dev/null; \
+	 launchctl unload "$(PLIST)" 2>/dev/null; \
+	 launchctl remove $(LABEL) 2>/dev/null; \
+	 sleep 1; \
+	 launchctl bootstrap gui/$$(id -u) "$(PLIST)" 2>/dev/null \
+	   || launchctl load -w "$(PLIST)" \
+	   || launchctl kickstart -k gui/$$(id -u)/$(LABEL)
+	@echo "AgentGuard running in the background (unix socket ~/.agentguard/agentguard.sock)"
+	@echo "Wiring detected AI agents (Claude Code / Cursor)..."
+	"$(PREFIX)/bin/agentguard" install-hooks
+
+uninstall:
+	-"$(PREFIX)/bin/agentguard" uninstall-hooks 2>/dev/null
+	-launchctl bootout gui/$$(id -u)/$(LABEL) 2>/dev/null
+	rm -f "$(PLIST)"
+	sudo rm -f "$(PREFIX)/bin/agentguard"
+	@echo "Removed binary + service + agent hooks. Config kept at $(PREFIX)/etc/agentguard (delete manually if desired)."
+
+# --- Complete teardown -----------------------------------------------------
+# Removes EVERYTHING AgentGuard installed: both binaries, both launchd services,
+# the Claude Code / Cursor hooks, the installed config, and all local state
+# (~/.agentguard: sockets, audit log). Use before a from-scratch reinstall test.
+# Leaves toolchains (go/rust/cmake/boost) untouched — those are yours.
+purge:
+	-"$(PREFIX)/bin/agentguard" uninstall-hooks 2>/dev/null
+	-pkill -f 'agentguard --config' 2>/dev/null
+	-pkill -f 'kingfisherd' 2>/dev/null
+	-launchctl bootout gui/$$(id -u)/$(LABEL) 2>/dev/null
+	-launchctl bootout gui/$$(id -u)/$(KFLABEL) 2>/dev/null
+	-launchctl unload "$(PLIST)" 2>/dev/null
+	-launchctl unload "$(KFPLIST)" 2>/dev/null
+	-launchctl remove $(LABEL) 2>/dev/null
+	-launchctl remove $(KFLABEL) 2>/dev/null
+	rm -f "$(PLIST)" "$(KFPLIST)"
+	sudo rm -f "$(PREFIX)/bin/agentguard" "$(PREFIX)/bin/kingfisherd"
+	sudo rm -rf "$(PREFIX)/etc/agentguard"
+	rm -rf "$(HOME)/.agentguard"
+	@echo ""
+	@echo "Purged: binaries, launchd services, agent hooks, config, and ~/.agentguard."
+	@echo "Toolchains were left alone. Verify a clean slate with: make doctor"
+
+# --- Preflight check -------------------------------------------------------
+# Reports which toolchains are present before building, so you get a clear
+# shopping list instead of a confusing mid-build failure. Required: go.
+# Optional (only for kingfisherd): cargo (Rust), cmake, boost — if any are
+# missing, the agent still deploys on the builtin scanner.
+doctor:
+	@ok=1; \
+	echo "AgentGuard preflight"; \
+	echo "===================="; \
+	if command -v go >/dev/null 2>&1; then \
+		echo "  [ok]      go      $$(go version | awk '{print $$3}')  (required)"; \
+	else \
+		echo "  [MISSING] go              (required)  ->  brew install go   (or https://go.dev/dl)"; ok=0; \
+	fi; \
+	if command -v cargo >/dev/null 2>&1 || [ -x "$$HOME/.cargo/bin/cargo" ]; then \
+		echo "  [ok]      cargo           (kingfisherd)"; \
+	else \
+		echo "  [warn]    cargo           (kingfisherd)  ->  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"; \
+	fi; \
+	if command -v cmake >/dev/null 2>&1; then \
+		echo "  [ok]      cmake           (kingfisherd)"; \
+	else \
+		echo "  [warn]    cmake           (kingfisherd)  ->  brew install cmake"; \
+	fi; \
+	if [ -d "$(BREW_PREFIX)/include/boost" ] || brew list boost >/dev/null 2>&1; then \
+		echo "  [ok]      boost           (kingfisherd)"; \
+	else \
+		echo "  [warn]    boost           (kingfisherd)  ->  brew install boost"; \
+	fi; \
+	echo ""; \
+	if [ $$ok -eq 0 ]; then \
+		echo "Missing a REQUIRED tool — install it and re-run. Aborting."; \
+		exit 1; \
+	fi; \
+	echo "Required tools present. [warn] items only disable kingfisherd (agent still runs on the builtin scanner)."
+
+# --- Bootstrap toolchains (invasive) ---------------------------------------
+# Installs the build prerequisites: go/cmake/boost via Homebrew and Rust via the
+# official rustup installer. Idempotent — skips anything already present. macOS
+# only. This MODIFIES your system, so it's kept out of `deploy`; use `make setup`
+# to bootstrap then deploy in one go.
+bootstrap:
+	@command -v brew >/dev/null 2>&1 || { \
+		echo "Homebrew is required but not installed — get it from https://brew.sh, then re-run."; \
+		exit 1; \
+	}
+	@if command -v go >/dev/null 2>&1; then echo "  go: present"; else echo ">> installing go...";   brew install go; fi
+	@if command -v cmake >/dev/null 2>&1; then echo "  cmake: present"; else echo ">> installing cmake..."; brew install cmake; fi
+	@if [ -d "$(BREW_PREFIX)/include/boost" ] || brew list boost >/dev/null 2>&1; then echo "  boost: present"; else echo ">> installing boost..."; brew install boost; fi
+	@if command -v cargo >/dev/null 2>&1 || [ -x "$$HOME/.cargo/bin/cargo" ]; then echo "  rust: present"; else \
+		echo ">> installing Rust (rustup)..."; \
+		curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; \
+	fi
+	@echo ""
+	@echo "Bootstrap complete."
+
+# --- Fresh machine -> running agent, in one command ------------------------
+# Installs every prerequisite (bootstrap) then builds + installs + wires up
+# everything (deploy). The do-everything path. Adds ~/.cargo/bin to PATH so a
+# freshly installed Rust is found without opening a new shell.
+setup: bootstrap
+	@PATH="$$HOME/.cargo/bin:$(BREW_PREFIX)/bin:$$PATH" $(MAKE) deploy
+
+# --- One command to rule them all ------------------------------------------
+# Builds + installs the daemon, wires up Claude Code / Cursor hooks, and (best
+# effort) builds + installs the resident Kingfisher scanner. kingfisherd is
+# optional: if the Rust toolchain isn't present the build is skipped and inline
+# scans use the builtin scanner. Prompts for your sudo password once.
+# Runs the preflight check first so missing tools fail fast with guidance.
+deploy: doctor install
+	@echo ""
+	@echo ">> Building resident Kingfisher scanner (optional)..."
+	@$(MAKE) install-kingfisher || { \
+		echo ""; \
+		echo ">> Skipped kingfisherd (Rust toolchain or build deps missing)."; \
+		echo ">> Inline scans use the builtin scanner. To enable Kingfisher's 950+ rules:"; \
+		echo ">>   brew install cmake boost && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"; \
+		echo ">>   source ~/.cargo/env && make install-kingfisher"; \
+	}
+	@echo ""
+	@echo "================================================================"
+	@echo " AgentGuard is deployed and running."
+	@echo "   daemon:   $(PREFIX)/bin/agentguard  (launchd: $(LABEL))"
+	@echo "   hooks:    Claude Code + Cursor wired"
+	@echo "   inline:   kingfisherd if present, else builtin scanner"
+	@echo "================================================================"
+
+# --- Resident Kingfisher scanner (optional) --------------------------------
+# Requires the Rust toolchain (>= 1.94) plus cmake and boost (Vectorscan build
+# deps):
+#   brew install cmake boost
+#   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # then: source ~/.cargo/env
+#   (or, with Homebrew's keg-only rustup: export PATH="$(brew --prefix rustup)/bin:$PATH" && rustup default stable)
+# Once installed, AgentGuard's inline scanner automatically uses kingfisherd
+# (detected via its socket) and falls back to the builtin scanner if it's down.
+BREW_PREFIX := $(shell brew --prefix 2>/dev/null || echo /usr/local)
+# Find cargo no matter how Rust was installed (rustup script -> ~/.cargo/bin,
+# Homebrew keg-only rustup -> $(brew --prefix rustup)/bin, or already on PATH).
+CARGO_PATH := $(HOME)/.cargo/bin:$(BREW_PREFIX)/opt/rustup/bin:$(PATH)
+build-kingfisher:
+	cd kingfisherd && PATH="$(CARGO_PATH)" BOOST_ROOT="$(BREW_PREFIX)" CMAKE_PREFIX_PATH="$(BREW_PREFIX)" cargo build --release
+
+install-kingfisher: build-kingfisher
+	sudo install -m 0755 kingfisherd/target/release/kingfisherd "$(PREFIX)/bin/kingfisherd"
+	mkdir -p "$(HOME)/Library/LaunchAgents"
+	sed -e 's#/usr/local/bin/kingfisherd#$(PREFIX)/bin/kingfisherd#' \
+	    -e 's#SOCKET_PATH#$(KFSOCKET)#' \
+	    packaging/launchd/$(KFLABEL).plist > "$(KFPLIST)"
+	@launchctl bootout gui/$$(id -u)/$(KFLABEL) 2>/dev/null; \
+	 launchctl bootout gui/$$(id -u) "$(KFPLIST)" 2>/dev/null; \
+	 launchctl unload "$(KFPLIST)" 2>/dev/null; \
+	 launchctl remove $(KFLABEL) 2>/dev/null; \
+	 sleep 1; \
+	 launchctl bootstrap gui/$$(id -u) "$(KFPLIST)" 2>/dev/null \
+	   || launchctl load -w "$(KFPLIST)" \
+	   || launchctl kickstart -k gui/$$(id -u)/$(KFLABEL)
+	@echo "kingfisherd running — inline scans now use Kingfisher's 950+ rules (fast, compiled once)."
+
+uninstall-kingfisher:
+	-launchctl bootout gui/$$(id -u)/$(KFLABEL) 2>/dev/null
+	rm -f "$(KFPLIST)"
+	sudo rm -f "$(PREFIX)/bin/kingfisherd"
+	@echo "Removed kingfisherd; inline scans fall back to the builtin scanner."
+
+service-restart:
+	launchctl kickstart -k gui/$$(id -u)/$(LABEL)
+
+service-status:
+	launchctl print gui/$$(id -u)/$(LABEL) | grep -E 'state|pid' || echo "not loaded"
+
+clean:
+	rm -rf bin dist

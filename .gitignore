@@ -1,0 +1,50 @@
+# --- Build output ---
+/bin/
+/dist/
+/agentguard
+/kingfisherd
+# Rust build artifacts (kingfisherd and any future crates)
+target/
+**/target/
+
+# --- Go test / profiling artifacts ---
+*.test
+*.out
+coverage.out
+*.prof
+*.cover
+
+# --- Logs & local runtime state ---
+*.log
+.agentguard/
+# audit logs / local queues if ever written into the repo dir
+audit.log
+queue/
+
+# --- Secrets & local config (security product — never push these) ---
+# Note: kept targeted (by extension / known names) rather than broad substrings
+# like *secret* so legitimate source files (e.g. secrets.go) aren't excluded.
+.env
+.env.*
+*.local.json
+config.local.json
+secrets.json
+credentials.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.token
+enrollment*.json
+device-token*
+
+# --- OS / editor cruft ---
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+*.iml
