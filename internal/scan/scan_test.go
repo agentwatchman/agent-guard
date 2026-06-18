@@ -38,6 +38,40 @@ func TestScan(t *testing.T) {
 	}
 }
 
+// IsSecretPath flags real secret-file references but NOT plain prose that merely
+// mentions "credentials"/"secret"/"id_rsa" (it's matched against whole Bash
+// command strings, so loose substrings would cause false denies).
+func TestIsSecretPath(t *testing.T) {
+	secret := []string{
+		"/repo/.env",
+		"cat ~/.aws/credentials",
+		"cp ~/.ssh/id_rsa /tmp",
+		"openssl rsa -in server.pem",
+		"cat ./secrets/token",
+		"tar czf out secrets/",
+		"read creds from path/credentials",
+	}
+	benign := []string{
+		`echo "update the credentials doc"`,
+		"grep -r credentials ./src",
+		`git commit -m "refactor credentials flow"`,
+		"npm run test:credentials",
+		`echo "my secrets are safe"`,
+		"echo id_rsapassword",
+		"./mysecrets/run.sh",
+	}
+	for _, s := range secret {
+		if !IsSecretPath(s) {
+			t.Errorf("expected secret: %q", s)
+		}
+	}
+	for _, s := range benign {
+		if IsSecretPath(s) {
+			t.Errorf("false positive (should be benign): %q", s)
+		}
+	}
+}
+
 // A detection carries critical severity; a clean result carries none.
 func TestScanSeverity(t *testing.T) {
 	if got := Scan(types.ScanRequest{Text: "AKIAIOSFODNN7EXAMPLE"}); got.Severity != "critical" {

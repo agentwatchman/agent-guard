@@ -21,7 +21,14 @@ import (
 // keys, id_rsa, credentials/secrets dirs). Shared by the policy engine (to deny
 // secret-file reads) and the scanner (to flag a secret file attached to a
 // prompt).
-var secretPath = regexp.MustCompile(`(^|[^a-zA-Z0-9])\.env([^a-zA-Z0-9]|$)|/\.aws/|/\.ssh/|\.pem([^a-zA-Z0-9]|$)|id_rsa|credentials|secrets?/`)
+//
+// NOTE: this is matched against whole Bash command strings too (policy
+// readsSecret), so every alternative is boundary-/path-anchored to avoid
+// flagging plain prose. The bare words "credentials"/"id_rsa"/"secrets" must
+// appear as a path component (preceded by a separator) or a whole token, not
+// merely as a substring of an English sentence — e.g. `echo "update the
+// credentials doc"` must NOT be treated as a secret read.
+var secretPath = regexp.MustCompile(`(^|[^a-zA-Z0-9])\.env([^a-zA-Z0-9]|$)|/\.aws/|/\.ssh/|\.pem([^a-zA-Z0-9]|$)|\bid_rsa\b|[/\\]credentials\b|\bsecrets?/`)
 
 // IsSecretPath reports whether s references a sensitive file or directory.
 func IsSecretPath(s string) bool { return secretPath.MatchString(s) }

@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -183,5 +184,29 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 	if snap["evaluate_total"] != 2 || snap["evaluate_allow"] != 1 || snap["evaluate_deny"] != 1 {
 		t.Errorf("metrics snapshot wrong: %v", snap)
+	}
+}
+
+// The built-in starter policy (used to seed a missing config) must stay in sync
+// with the repo's config.json, so editing one without the other can't silently
+// drift. Compares semantically (parsed Config), ignoring formatting.
+func TestDefaultConfigMatchesRepo(t *testing.T) {
+	repoPath := filepath.Join("..", "..", "config.json")
+	repoBytes, err := os.ReadFile(repoPath)
+	if err != nil {
+		t.Fatalf("read repo config %s: %v", repoPath, err)
+	}
+
+	var repo, builtin types.Config
+	if err := json.Unmarshal(repoBytes, &repo); err != nil {
+		t.Fatalf("repo config.json is not valid JSON: %v", err)
+	}
+	if err := json.Unmarshal(defaultConfigJSON(), &builtin); err != nil {
+		t.Fatalf("defaultConfigJSON is not valid JSON: %v", err)
+	}
+
+	if !reflect.DeepEqual(repo, builtin) {
+		t.Errorf("config drift: repo config.json %+v != defaultConfigJSON() %+v\n"+
+			"update both internal/server/server.go:defaultConfigJSON and ./config.json", repo, builtin)
 	}
 }

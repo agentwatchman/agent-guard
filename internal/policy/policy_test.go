@@ -40,6 +40,15 @@ func TestEvaluate(t *testing.T) {
 		{"webfetch scheme-less url", ev("WebFetch", map[string]any{"url": "example.com"}), types.Ask},
 		{"normal build", ev("Bash", map[string]any{"command": "go build ./..."}), types.Allow},
 		{"plain file read", ev("Read", map[string]any{"file_path": "/repo/main.go"}), types.Allow},
+		// Prose / dev commands that merely mention "credentials"/"secret" must
+		// NOT be treated as secret reads (boundary-anchored secretPath).
+		{"prose mentions credentials", ev("Bash", map[string]any{"command": `echo "update the credentials doc"`}), types.Allow},
+		{"grep own code for credentials", ev("Bash", map[string]any{"command": "grep -r credentials ./src"}), types.Allow},
+		{"commit msg mentions credentials", ev("Bash", map[string]any{"command": `git commit -m "refactor credentials flow"`}), types.Allow},
+		{"id_rsa substring in word", ev("Bash", map[string]any{"command": "echo id_rsapassword"}), types.Allow},
+		// Real secret-file access still denies.
+		{"cat aws credentials file", ev("Bash", map[string]any{"command": "cat ~/.aws/credentials"}), types.Deny},
+		{"copy ssh private key", ev("Bash", map[string]any{"command": "cp ~/.ssh/id_rsa /tmp"}), types.Deny},
 	}
 
 	for _, c := range cases {
