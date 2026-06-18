@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -179,80 +178,6 @@ func TestScan(t *testing.T) {
 				t.Errorf("Scan(%q) found=%v, want %v", c.req, got, c.want)
 			}
 		})
-	}
-}
-
-// Scanner backend selection: modes resolve correctly. Constructed directly so
-// the test is deterministic regardless of whether kingfisher is installed.
-func TestScannerBackendSelection(t *testing.T) {
-	cases := []struct {
-		mode string
-		path string
-		want bool
-	}{
-		{"builtin", "/x/kingfisher", false}, // builtin never uses it
-		{"kingfisher", "", false},           // forced but no binary -> can't
-		{"kingfisher", "/x/kingfisher", true},
-		{"auto", "", false}, // auto with nothing found
-		{"auto", "/x/kingfisher", true},
-	}
-	for _, c := range cases {
-		s := &Scanner{Mode: c.mode, KingfisherPath: c.path}
-		if got := s.useKingfisher(); got != c.want {
-			t.Errorf("mode=%q path=%q useKingfisher=%v, want %v", c.mode, c.path, got, c.want)
-		}
-	}
-	// Empty mode defaults to auto.
-	if s := NewScanner("", ""); s.Mode != "auto" {
-		t.Errorf("empty mode should default to auto, got %q", s.Mode)
-	}
-}
-
-// When Kingfisher isn't available, Scanner.Scan must fall back to the builtin
-// scanner (fail-safe) and still catch obvious secrets.
-func TestScannerFallsBackToBuiltin(t *testing.T) {
-	s := NewScanner("builtin", "")
-	if !s.Scan(ScanRequest{Text: "key sk-abcdef0123456789ABCDEF01"}).Found {
-		t.Error("builtin fallback should still catch an OpenAI key")
-	}
-	if s.Scan(ScanRequest{Text: "refactor the login handler"}).Found {
-		t.Error("builtin fallback should not flag a benign prompt")
-	}
-}
-
-// kingfisherScan decides by exit code (0 none / 200 found) and extracts the
-// rule name from JSON output. Verified with a stand-in script.
-func TestKingfisherScanExitCodes(t *testing.T) {
-	dir := t.TempDir()
-	found := filepath.Join(dir, "kf-found.sh")
-	if err := os.WriteFile(found, []byte("#!/bin/sh\necho '{\"rule_name\":\"OpenAI API Key\"}'\nexit 200\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	none := filepath.Join(dir, "kf-none.sh")
-	if err := os.WriteFile(none, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	res, err := kingfisherScan(found, ScanRequest{Text: "sk-abcdef0123456789ABCDEF01"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !res.Found || !strings.Contains(res.Reason, "OpenAI API Key") {
-		t.Errorf("expected found with rule name, got %+v", res)
-	}
-
-	res, err = kingfisherScan(none, ScanRequest{Text: "hello world"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if res.Found {
-		t.Errorf("expected no finding, got %+v", res)
-	}
-
-	// A sensitive attachment path is caught without invoking the binary at all.
-	res, err = kingfisherScan(none, ScanRequest{Text: "review", Paths: []string{"/repo/.env"}})
-	if err != nil || !res.Found {
-		t.Errorf("expected attachment path to be flagged, got %+v err=%v", res, err)
 	}
 }
 

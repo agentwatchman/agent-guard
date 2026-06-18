@@ -88,7 +88,7 @@ Usage:
   agentguard uninstall-hooks [--claude] [--cursor]  remove AgentGuard hook entries
   agentguard claude-hook                            Claude Code hook handler (reads stdin)
   agentguard cursor-hook                            Cursor hook handler (reads stdin)
-  agentguard scan [--config p] [file|-]             deep secret scan (Kingfisher); reads file or stdin
+  agentguard scan [file|-]                          secret scan (builtin + kingfisherd); reads file or stdin
   agentguard version
 
 With no --claude/--cursor flag, install-hooks/uninstall-hooks auto-detect which
@@ -159,19 +159,13 @@ func serve(args []string) {
 	log.Fatal(srv.Serve(ln))
 }
 
-// cmdScan is an explicit, on-demand deep scan (CI / manual audits). Unlike the
-// inline hook path, it uses the configured backend (Kingfisher by default if
-// installed), so the ~4s cost is acceptable here. Reads a file path or stdin.
+// cmdScan is an explicit, on-demand scan (CI / manual audits). It runs the same
+// union as the inline path — the builtin scanner plus the resident kingfisherd
+// (if running) — and reports every finding. Reads a file path or stdin.
 // Exit codes mirror common scanners: 0 = clean, 200 = secret found.
 func cmdScan(args []string) {
 	fs := flag.NewFlagSet("scan", flag.ExitOnError)
-	cfgPath := fs.String("config", "", "optional policy config (for scanner backend)")
 	_ = fs.Parse(args)
-
-	// Config is optional here; the scanner defaults to "auto" when absent.
-	if *cfgPath != "" {
-		_ = loadConfig(*cfgPath)
-	}
 
 	var text string
 	if rest := fs.Args(); len(rest) > 0 && rest[0] != "-" {
