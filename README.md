@@ -18,7 +18,10 @@ Each agent is wired with **command hooks** that spawn `agentguard <agent>-hook`.
 That handler translates the agent's event into a common schema and asks the
 **daemon** over a Unix domain socket for a decision. The daemon runs the policy
 rule pipeline (tool calls) or the secret scanner (prompts), writes a redacted
-audit record, and returns **allow / deny / ask**. Everything stays local.
+audit record, and returns **allow / deny / ask**. Enforcement is fully local.
+Optionally, a redacted projection of each decision can be shipped off the box
+(file and/or HTTPS sinks) — **off by default, off the hook path**, and never
+carrying raw secrets, commands, or paths (see [Cloud shipping](#cloud-shipping-optional-off-by-default)).
 
 ```mermaid
 flowchart LR
@@ -55,7 +58,21 @@ flowchart LR
     EV --> AUD["audit log<br/>~/.agentguard/audit.log<br/>redacted · rotating"]
     SC --> AUD
 
-    CFG["config.json<br/>~/.agentguard/config.json<br/>allowed_egress · approved_mcp · disabled_rules"] -.->|"auto-reload (file watcher)"| D
+    CFG["config.json<br/>~/.agentguard/config.json<br/>allowed_egress · approved_mcp<br/>disabled_rules · cloud"] -.->|"auto-reload (file watcher)"| D
+
+    subgraph Cloud["optional cloud shipping — off by default, off the hook path"]
+        RDX["redact() boundary<br/>internal/cloud<br/>allowlisted CloudEvent only"]
+        SHP["shipper<br/>bounded queue · drop-newest<br/>non-blocking · cloud_dropped metric"]
+        FS["file sink<br/>~/.agentguard/events.ndjson"]
+        HS["https sink<br/>POST to ingest endpoint"]
+        RDX --> SHP
+        SHP --> FS
+        SHP --> HS
+    end
+
+    EV -.->|"if cloud enabled"| RDX
+    SC -.->|"if cloud enabled"| RDX
+    HS -.->|"HTTPS"| CPL["control plane / preview<br/>tools/cloud-preview"]
 ```
 
 Request flow for a single tool call:
@@ -68,6 +85,7 @@ sequenceDiagram
     participant D as Daemon
     participant P as Policy pipeline
     participant L as Audit log
+    participant S as Shipper (optional)
 
     A->>H: tool-call event (stdin JSON)
     H->>D: POST /v1/evaluate (Unix socket)
@@ -77,6 +95,8 @@ sequenceDiagram
     D->>L: append redacted record
     D-->>H: allow / deny / ask
     H-->>A: permission decision (stdout)
+    D-)S: ship redacted CloudEvent (async, if cloud enabled)
+    Note over D,S: enqueue is non-blocking — never delays the decision
     Note over A,H: daemon unreachable → fail closed (deny / block)
 ```
 
