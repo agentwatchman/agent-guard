@@ -6,7 +6,7 @@ package server
 import (
 	"encoding/json"
 	"flag"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -22,13 +22,24 @@ import (
 	"agentguard/internal/types"
 )
 
-// Daemon holds the running daemon's state: the hot-swappable policy config and
-// the audit logger. Bundling it in a struct (rather than package globals) keeps
-// the state explicit, lets handlers be methods, and makes the daemon testable.
+// Daemon holds the running daemon's state: the hot-swappable policy config, the
+// audit logger, a structured logger, and aggregate counters. Bundling it in a
+// struct (rather than package globals) keeps the state explicit, lets handlers
+// be methods, and makes the daemon testable.
 type Daemon struct {
 	cfgMu sync.RWMutex
 	cfg   types.Config
 	audit *audit.Logger
+	log   *slog.Logger
+	met   metrics
+}
+
+// logger returns the daemon's structured logger, falling back to the default.
+func (d *Daemon) logger() *slog.Logger {
+	if d.log != nil {
+		return d.log
+	}
+	return slog.Default()
 }
 
 // Run starts the daemon on a Unix domain socket. No TCP port means nothing to
@@ -38,16 +49,18 @@ func Run(args []string) {
 	cfgPath := fs.String("config", "config.json", "path to policy config")
 	_ = fs.Parse(args)
 
-	d := &Daemon{}
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	d := &Daemon{log: logger}
 	if err := d.loadConfig(*cfgPath); err != nil {
-		log.Fatalf("failed to load config %s: %v", *cfgPath, err)
+		logger.Error("failed to load config", "path", *cfgPath, "err", err)
+		os.Exit(1)
 	}
 
 	home, _ := os.UserHomeDir()
 	logPath := filepath.Join(home, ".agentguard", "audit.log")
 	_ = os.MkdirAll(filepath.Dir(logPath), 0o755)
 	if l, err := audit.Open(logPath); err != nil {
-		log.Printf("warning: could not open audit log: %v", err)
+		logger.Warn("could not open audit log", "err", err)
 	} else {
 		d.audit = l
 		defer d.audit.Close()
@@ -58,7 +71,8 @@ func Run(args []string) {
 	_ = os.Remove(sock) // clear any stale socket from a previous crash
 	ln, err := net.Listen("unix", sock)
 	if err != nil {
-		log.Fatalf("failed to listen on socket %s: %v", sock, err)
+		logger.Error("failed to listen on socket", "socket", sock, "err", err)
+		os.Exit(1)
 	}
 	_ = os.Chmod(sock, 0o600) // restrict to the current user
 	defer os.Remove(sock)
@@ -72,9 +86,25 @@ func Run(args []string) {
 		os.Exit(0)
 	}()
 
+	// Hot-reload the policy config on SIGHUP (e.g. `make service-reload`) without
+	// dropping the socket. On a bad config we keep the previous one rather than
+	// failing open or crashing.
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	go func() {
+		for range hup {
+			if err := d.loadConfig(*cfgPath); err != nil {
+				d.logger().Error("config reload failed (keeping previous config)", "err", err)
+			} else {
+				d.logger().Info("config reloaded", "path", *cfgPath)
+			}
+		}
+	}()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/evaluate", d.handleEvaluate)
 	mux.HandleFunc("/v1/scan", d.handleScan)
+	mux.HandleFunc("/metrics", d.handleMetrics)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 
 	srv := &http.Server{
@@ -82,10 +112,16 @@ func Run(args []string) {
 		ReadTimeout:  3 * time.Second,
 		WriteTimeout: 3 * time.Second,
 	}
-	log.Printf("AgentGuard listening on unix socket %s", sock)
-	log.Printf("audit log: %s", logPath)
-	log.Printf("inline scanner: builtin + kingfisherd (if running)")
-	log.Fatal(srv.Serve(ln))
+	logger.Info("AgentGuard daemon started",
+		"socket", sock,
+		"audit_log", logPath,
+		"scanner", "builtin + kingfisherd (if running)",
+		"reload_signal", "SIGHUP",
+	)
+	if err := srv.Serve(ln); err != nil {
+		logger.Error("server stopped", "err", err)
+		os.Exit(1)
+	}
 }
 
 // loadConfig reads the policy config from disk and swaps it in under the lock.
@@ -135,6 +171,7 @@ func (d *Daemon) handleEvaluate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := policy.Evaluate(d.config(), e)
+	d.met.recordEvaluate(resp.HookSpecificOutput.PermissionDecision)
 	d.audit.Evaluate(e, resp)
 
 	w.Header().Set("Content-Type", "application/json")
@@ -150,6 +187,7 @@ func (d *Daemon) handleScan(w http.ResponseWriter, r *http.Request) {
 	// kingfisherd (if up) and merges every finding, so a multi-secret prompt is
 	// fully reported. A resident error is ignored, so the hot path never blocks.
 	res := scan.ScanAll(req)
+	d.met.recordScan(res.Found)
 	d.audit.Scan(res, req.Agent)
 
 	w.Header().Set("Content-Type", "application/json")

@@ -1,4 +1,4 @@
-.PHONY: build run test release clean install uninstall deploy setup bootstrap doctor purge service-restart service-status \
+.PHONY: build run test release clean install uninstall deploy setup bootstrap doctor purge service-restart service-reload service-status \
         build-kingfisher install-kingfisher uninstall-kingfisher
 
 # Where the manual (non-Homebrew) install puts things. Override with: make install PREFIX=/opt
@@ -215,6 +215,11 @@ uninstall-kingfisher:
 
 service-restart:
 	launchctl kickstart -k gui/$$(id -u)/$(LABEL)
+
+# Hot-reload config.json without restarting the daemon (SIGHUP). Use after
+# editing the installed config at $(PREFIX)/etc/agentguard/config.json.
+service-reload:
+	launchctl kill SIGHUP gui/$$(id -u)/$(LABEL) && echo "sent SIGHUP — config reloaded (check: log show or make service-status)"
 
 service-status:
 	launchctl print gui/$$(id -u)/$(LABEL) | grep -E 'state|pid' || echo "not loaded"

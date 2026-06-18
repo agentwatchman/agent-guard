@@ -108,6 +108,7 @@ private Homebrew tap, manual install, and Linux — is in
 | Any read of `.env` / `~/.aws` / `~/.ssh` / `*.pem` / credentials | **deny** |
 | Prompt (or attached file) containing secrets — Cursor `beforeSubmitPrompt` | **block** |
 | Network call (`curl`/`wget`/…) to a domain not in `allowed_egress` | **ask** |
+| Agent-native fetch (`WebFetch`/…) to a domain not in `allowed_egress` | **ask** |
 | Destructive command (`rm -rf`, `git push --force`, `DROP TABLE`…) | **ask** |
 | Call to an MCP server not in `approved_mcp` | **deny** |
 | Everything else | **allow** |
@@ -161,9 +162,9 @@ agentguard scan ./path/to/file
 > Kingfisher is **not** used inline: it recompiles its 950 rules on every
 > invocation (~4s), far too slow for a blocking hook. The deep-scan command
 > always runs it with `--no-validate`, so **no secret is sent to a third-party
-> API** — detection stays local. The `"scanner"` / `"kingfisher_path"` keys in
-> `config.json` select the backend for `agentguard scan` (`auto` / `builtin` /
-> `kingfisher`).
+> API** — detection stays local. `agentguard scan` auto-detects Kingfisher on
+> your `PATH` and falls back to the builtin scanner when it's absent — no config
+> needed.
 
 ## Audit log
 
@@ -186,6 +187,27 @@ so a multi-secret prompt is fully attributed:
  "findings":[{"source":"builtin","rule":"AWS access key id"},
              {"source":"kingfisher","rule":"GitLab Private Token"}]}
 ```
+
+## Observing the daemon
+
+Three surfaces, by purpose:
+
+| What | Where | Use it for |
+|---|---|---|
+| Operational log (`slog`) | `/tmp/agentguard.err.log` | daemon start, config reloads, errors |
+| Audit log | `~/.agentguard/audit.log` | per-decision redacted records |
+| Live counters | `GET /metrics` (over the socket) | aggregate allow/ask/deny + scan totals |
+
+```bash
+tail -f /tmp/agentguard.err.log                                          # operational log
+curl -s --unix-socket ~/.agentguard/agentguard.sock http://unix/metrics  # counters
+make service-status                                                      # is it running?
+```
+
+The operational log path above is set by the launchd service. Running the daemon
+in the foreground (`make run`) prints those same `slog` lines to your terminal
+instead. `/metrics` returns a JSON snapshot, e.g.
+`{"evaluate_total":2,"evaluate_allow":1,"evaluate_deny":1,"scan_total":0,...}`.
 
 ## What's next (post-pilot)
 

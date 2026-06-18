@@ -34,6 +34,10 @@ func TestEvaluate(t *testing.T) {
 		{"unapproved mcp", ev("mcp__shady__run", map[string]any{}), types.Deny},
 		{"approved mcp", ev("mcp__github__create_issue", map[string]any{}), types.Allow},
 		{"curl approved domain", ev("Bash", map[string]any{"command": "curl https://api.github.com/repos"}), types.Allow},
+		{"webfetch approved domain", ev("WebFetch", map[string]any{"url": "https://api.github.com/repos"}), types.Allow},
+		{"webfetch approved subdomain", ev("WebFetch", map[string]any{"url": "https://docs.github.com/en/rest"}), types.Allow},
+		{"webfetch unapproved domain", ev("WebFetch", map[string]any{"url": "https://example.com"}), types.Ask},
+		{"webfetch scheme-less url", ev("WebFetch", map[string]any{"url": "example.com"}), types.Ask},
 		{"normal build", ev("Bash", map[string]any{"command": "go build ./..."}), types.Allow},
 		{"plain file read", ev("Read", map[string]any{"file_path": "/repo/main.go"}), types.Allow},
 	}

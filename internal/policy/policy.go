@@ -20,7 +20,13 @@ var (
 )
 
 // extract pulls the relevant fields out of the tool input.
-func extract(e types.HookEvent) (cmd, filePath, mcpServer string) {
+//
+// fetchURL is the target of an agent-native fetch tool (Claude's WebFetch,
+// Cursor's web fetch, etc.) whose URL lives in a `url`/`uri` field rather than a
+// shell command — so the shell-based egress check (netExfil over `command`)
+// never sees it. We deliberately skip MCP tools here: they carry their own URLs
+// but are governed by the separate approved_mcp gate below.
+func extract(e types.HookEvent) (cmd, filePath, mcpServer, fetchURL string) {
 	get := func(k string) string {
 		if v, ok := e.ToolInput[k].(string); ok {
 			return v
@@ -33,13 +39,18 @@ func extract(e types.HookEvent) (cmd, filePath, mcpServer string) {
 		if parts := strings.Split(e.ToolName, "__"); len(parts) >= 2 {
 			mcpServer = parts[1]
 		}
+		return
+	}
+	fetchURL = get("url")
+	if fetchURL == "" {
+		fetchURL = get("uri")
 	}
 	return
 }
 
 // Evaluate runs the policy. Order matters: highest-severity first.
 func Evaluate(cfg types.Config, e types.HookEvent) types.HookResponse {
-	cmd, filePath, mcpServer := extract(e)
+	cmd, filePath, mcpServer, fetchURL := extract(e)
 
 	readsSecret := scan.IsSecretPath(filePath) || (cmd != "" && scan.IsSecretPath(cmd))
 	touchesNet := netExfil.MatchString(cmd)
@@ -54,14 +65,18 @@ func Evaluate(cfg types.Config, e types.HookEvent) types.HookResponse {
 		return types.Decide(types.Deny, "Access to secrets/credentials is not permitted for the agent.")
 	}
 
-	// 3) Egress control — outbound network must target an approved domain.
+	// 3) Egress control — outbound network must target an approved domain. This
+	// covers both shell network tools (curl/wget/…) and agent-native fetch tools
+	// (WebFetch/…) under the SAME allowlist. An unresolvable host fails closed to
+	// ask, never allow.
 	if touchesNet {
-		host := ""
-		if m := urlHost.FindStringSubmatch(cmd); len(m) > 1 {
-			host = m[1]
-		}
-		if !domainAllowed(host, cfg.AllowedEgress) {
+		if host := hostOf(cmd); !domainAllowed(host, cfg.AllowedEgress) {
 			return types.Decide(types.Ask, "Network call to unapproved domain ("+host+") — needs approval.")
+		}
+	}
+	if fetchURL != "" {
+		if host := hostOf(fetchURL); !domainAllowed(host, cfg.AllowedEgress) {
+			return types.Decide(types.Ask, "Web fetch to unapproved domain ("+host+") — needs approval.")
 		}
 	}
 
@@ -76,6 +91,15 @@ func Evaluate(cfg types.Config, e types.HookEvent) types.HookResponse {
 	}
 
 	return types.Decide(types.Allow, "")
+}
+
+// hostOf pulls the hostname out of the first http(s) URL in s, or "" if there
+// is none (e.g. a scheme-less URL), which callers treat as not-allowed.
+func hostOf(s string) string {
+	if m := urlHost.FindStringSubmatch(s); len(m) > 1 {
+		return m[1]
+	}
+	return ""
 }
 
 func domainAllowed(host string, allow []string) bool {
