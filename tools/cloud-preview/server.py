@@ -119,6 +119,9 @@ INDEX_HTML = """<!doctype html>
   .b-allow { background:rgba(46,160,67,.15); color:var(--allow); }
   .b-ask   { background:rgba(210,153,34,.15); color:var(--ask); }
   .b-deny  { background:rgba(248,81,73,.15); color:var(--deny); }
+  .b-bi    { background:rgba(59,130,246,.15); color:var(--accent); }
+  .b-kf    { background:rgba(168,85,247,.18); color:#c084fc; }
+  .muted   { color:var(--muted); }
   .sev { font-size:10.5px; padding:1px 7px; border-radius:999px; background:rgba(248,81,73,.12); color:var(--crit); }
   .agent { color:var(--accent); }
   .empty { padding:40px; text-align:center; color:var(--muted); }
@@ -146,10 +149,10 @@ INDEX_HTML = """<!doctype html>
 <div class="wrap">
   <table>
     <thead>
-      <tr><th>Time</th><th>Agent</th><th>Tool</th><th>Decision</th><th>Rule</th><th>Reason</th></tr>
+      <tr><th>Time</th><th>Agent</th><th>Tool</th><th>Decision</th><th>Source</th><th>Rule</th><th>Reason</th></tr>
     </thead>
     <tbody id="rows">
-      <tr><td colspan="6" class="empty">No events yet — run <span class="mono">./test.sh</span> against the daemon.</td></tr>
+      <tr><td colspan="7" class="empty">No events yet — run <span class="mono">./test.sh</span> against the daemon.</td></tr>
     </tbody>
   </table>
 </div>
@@ -166,6 +169,12 @@ function fmtTime(ts){ try { return new Date(ts).toLocaleTimeString(); } catch { 
 function badge(d){
   const cls = d==='allow'?'b-allow':d==='ask'?'b-ask':'b-deny';
   return `<span class="badge ${cls}">${esc(d||'?')}</span>`;
+}
+
+function srcBadge(s){
+  if (!s) return '<span class="muted">—</span>';
+  const cls = s==='kingfisher' ? 'b-kf' : 'b-bi';
+  return `<span class="badge ${cls}">${esc(s)}</span>`;
 }
 
 function render(ev, isNew){
@@ -197,6 +206,7 @@ function render(ev, isNew){
     `<td class="agent">${esc(ev.agent||'—')}</td>`+
     `<td class="mono">${esc(ev.tool||'—')}</td>`+
     `<td>${badge(ev.decision)}</td>`+
+    `<td>${srcBadge(ev.source)}</td>`+
     `<td>${rule||'—'}</td>`+
     `<td>${esc(ev.reason||'')}${find}</td>`;
   rows.insertBefore(tr, rows.firstChild);
