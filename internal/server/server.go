@@ -53,7 +53,13 @@ func (d *Daemon) logger() *slog.Logger {
 // conflict with another process; only this user can reach it (0600).
 func Run(args []string) {
 	home, _ := os.UserHomeDir()
-	defaultCfg := filepath.Join(home, ".agentguard", "config.json")
+	// ~/.agentguard holds the socket, config, audit log, and (later) device
+	// credentials. Keep it owner-only so no other user can read those or reach
+	// the socket. 0700 (not 0600) — a dir needs the execute bit to be traversed.
+	base := filepath.Join(home, ".agentguard")
+	_ = os.MkdirAll(base, 0o700)
+	_ = os.Chmod(base, 0o700) // tighten even if it pre-existed as 0755
+	defaultCfg := filepath.Join(base, "config.json")
 
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	cfgPath := fs.String("config", defaultCfg, "path to policy config")
@@ -97,6 +103,10 @@ func Run(args []string) {
 	_ = os.Chmod(sock, 0o600) // restrict to the current user
 	defer os.Remove(sock)
 
+	// Trust boundary: reject any peer not running as this user, kernel-verified
+	// per connection (can't be spoofed). Complements the 0600 socket mode.
+	ln = newPeerCredListener(ln, logger)
+
 	// Clean up the socket file on SIGINT/SIGTERM (launchd sends SIGTERM).
 	sigc := make(chan os.Signal, 1)
 	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
@@ -137,6 +147,7 @@ func Run(args []string) {
 		"audit_log", logPath,
 		"scanner", "builtin + kingfisherd (if running)",
 		"reload", "auto (file watch) + SIGHUP",
+		"socket_auth", "0600 + peer-uid check",
 	)
 	if err := srv.Serve(ln); err != nil {
 		logger.Error("server stopped", "err", err)

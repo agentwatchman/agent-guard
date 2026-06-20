@@ -143,6 +143,15 @@ make run                # starts the daemon on ~/.agentguard/agentguard.sock
 make test               # fires simulated tool-calls and prints decisions
 ```
 
+> **Dogfooding gotcha:** if you've wired AgentGuard's hooks into your own editor
+> and then develop *on this repo*, your editor's AI agent is gated by the daemon
+> too. Stop the daemon (e.g. Ctrl-C on a foreground `make run` / `make run-local`)
+> and the agent's own file edits, searches, and commands start **failing closed**
+> (denied) until it's back up — by design. Keep the daemon running while you work:
+> either leave `make run-local` up in a terminal, or use the installed
+> `KeepAlive` service (`make install`), which auto-restarts it. This only affects
+> foreground dev; installed users get the always-on service.
+
 ## Wire up your AI agents (Claude Code + Cursor + Codex)
 
 One command wires every detected agent to the daemon. It auto-detects which are
@@ -204,6 +213,55 @@ Or via Homebrew (`brew services start agentguard`). Full distribution guide —
 private Homebrew tap, manual install, and Linux — is in
 [`packaging/README.md`](packaging/README.md).
 
+## Configuration
+
+Policy lives in a JSON config. There are three locations — the repo files are
+**sources**, while `~/.agentguard/config.json` is what an installed daemon
+**actually runs**. Which one is live depends on how you start the daemon:
+
+| File | Committed? | Cloud | Read by |
+|---|---|---|---|
+| `config.json` (repo) | yes — the clean default / installer source | off | `make run`; copied to `~/.agentguard/` on `make install` |
+| `config.local.json` (repo) | no — gitignored, your machine only | on (testing) | `make run-local` |
+| `~/.agentguard/config.json` | n/a — your home dir | your choice | the installed background daemon (the **live** config) |
+
+```bash
+make run         # foreground, uses repo config.json (cloud off)
+make run-local   # foreground, uses config.local.json (cloud on → preview)
+make install     # background service, reads ~/.agentguard/config.json
+```
+
+Schema (all fields optional):
+
+```jsonc
+{
+  "allowed_egress": ["github.com", "..."],   // domains that DON'T trigger "ask"
+  "approved_mcp":   ["github", "linear"],     // MCP servers allowed without "deny"
+  "disabled_rules": [],                        // rule ids to turn off (see /metrics, audit log)
+  "cloud": { "enabled": false, "sinks": [] }   // optional shipping — see "Cloud shipping"
+}
+```
+
+**What hot-reloads vs. what needs a restart:**
+
+- **Hot (≈2s, file-watched):** `allowed_egress`, `approved_mcp`, `disabled_rules`.
+  Edit the file the running daemon was pointed at and save — no rebuild/restart.
+  A malformed edit is logged and ignored, keeping the last good policy.
+- **Restart required:** the `cloud` block. The event shipper is built once at
+  startup, so adding/removing/changing sinks needs a daemon restart.
+
+**Gotchas:**
+
+- **One socket, one daemon.** All run modes bind the same socket
+  (`~/.agentguard/agentguard.sock`), so you can't run `make run` / `run-local`
+  *and* the installed service at the same time. Check with `make service-status`
+  and stop the service before running in the foreground.
+- **Keep cloud/testing tweaks out of `config.json`.** The committed `config.json`
+  must match the built-in default (`defaultConfigJSON()` in
+  `internal/server/server.go`), enforced by `TestDefaultConfigMatchesRepo`. Put
+  personal/test settings in `config.local.json`; only change `config.json` when
+  you intend to change the *default*, and update `defaultConfigJSON()` to match.
+
 ## What it blocks (Tier 1 rules)
 
 | Scenario | Decision |
@@ -224,10 +282,9 @@ private Homebrew tap, manual install, and Linux — is in
 > Codex's `PreToolUse` likewise can't render `ask`, so it gets the same
 > downgrade, attributed to `codex`.
 
-Tune the allowlists in `~/.agentguard/config.json` (user-owned — no sudo). The
-daemon **watches the file and auto-reloads within ~2s** of a save — no rebuild,
-no restart, no command. (A malformed edit is logged and ignored, keeping the
-last good policy.) `make service-reload` forces an immediate reload if needed.
+Tune `allowed_egress` / `approved_mcp` / `disabled_rules` in your config (see
+[Configuration](#configuration)); the daemon auto-reloads policy within ~2s of a
+save. `make service-reload` forces an immediate reload if needed.
 
 ## Secret detection backends
 
@@ -322,6 +379,80 @@ The operational log path above is set by the launchd service. Running the daemon
 in the foreground (`make run`) prints those same `slog` lines to your terminal
 instead. `/metrics` returns a JSON snapshot, e.g.
 `{"evaluate_total":2,"evaluate_allow":1,"evaluate_deny":1,"scan_total":0,...}`.
+
+## Security: the local trust boundary
+
+The Unix socket is the boundary between the AI agent and the daemon — whoever can
+reach it can ask for a policy decision (and, with a cloud backend, attribute
+events to your device). **Layer 1 (OS-level)** locks that down at startup, and is
+in place today:
+
+| Control | What it does | Enforced by |
+|---|---|---|
+| `~/.agentguard/` → `0700` | only the owning user can traverse to the socket/config/logs | filesystem perms |
+| socket file → `0600` | only the owning user can connect | filesystem perms |
+| **peer-UID check** | every accepted connection must come from a process running as the **daemon's own UID**; mismatches are closed + logged | kernel (`LOCAL_PEERCRED` on macOS, `SO_PEERCRED` on Linux) |
+
+The peer-UID check is the backstop: it's **kernel-verified** (a caller can't
+forge its UID) and holds even if the socket mode is ever loosened or the socket
+lands in a shared directory. We deliberately do **not** verify the connecting
+binary's path (raceable on macOS, low value). On platforms without a peer-cred
+syscall (e.g. Windows) the check no-ops and the `0600` perms remain the gate.
+
+```mermaid
+flowchart TD
+    AG["AI agent action<br/>(edit · shell · read · prompt)"] --> HK["agentguard hook"]
+    HK --> C{"connect to<br/>~/.agentguard/agentguard.sock"}
+    C -->|"daemon down / unreachable"| FC["fail CLOSED<br/>deny · block"]
+    C -->|"connected"| L1
+
+    subgraph L1["Layer 1 — kernel-enforced trust boundary"]
+        P1{"filesystem perms<br/>dir 0700 · socket 0600"}
+        P1 -->|"another user"| R1["refused by OS<br/>(can't open the socket)"]
+        P1 -->|"owning user"| P2{"peer UID == daemon UID?<br/>LOCAL_PEERCRED / SO_PEERCRED"}
+        P2 -->|"no (spoof-proof)"| R2["close + log<br/>rejected socket connection"]
+        P2 -->|"yes"| A1["accepted"]
+    end
+
+    A1 --> DEC["daemon: policy pipeline / secret scan"]
+    DEC --> OUT["allow · deny · ask"]
+
+    L23(["Layer 2/3 (planned): per-install hook.token,<br/>then device enrollment + event signing"]) -.->|"adds app-level identity"| P2
+```
+
+Two independent gates protect the socket — the OS perms stop other users
+outright, and the kernel peer-UID check is the un-spoofable backstop behind it.
+A down daemon never silently opens: the hook fails closed before it even reaches
+these gates.
+
+**Verify it (after a restart, since perms/checks apply at startup):**
+
+```bash
+ls -ld ~/.agentguard                    # drwx------ (0700)
+ls -l  ~/.agentguard/agentguard.sock    # srw------- (0600)
+curl -s --unix-socket ~/.agentguard/agentguard.sock http://unix/healthz   # same user → 200
+```
+
+To exercise the peer-UID backstop in isolation (it normally sits behind the file
+perms), run on a world-reachable socket, loosen it, and connect as another user:
+
+```bash
+# terminal 1
+AGENTGUARD_SOCKET=/tmp/ag-test.sock ./bin/agentguard --config config.json
+# terminal 2
+chmod 666 /tmp/ag-test.sock
+sudo -u nobody curl -s --unix-socket /tmp/ag-test.sock http://unix/healthz   # rejected
+```
+
+Even at `0666`, the daemon refuses the `nobody` connection and logs
+`rejected socket connection err="peer uid … != daemon uid …"`. (Remove that test
+socket afterward.)
+
+> **Layers 2–3 (planned, land with the cloud ingest):** a per-install
+> `hook.token` presented on the first frame of every connection, then device
+> enrollment + event signing so the cloud can attribute and verify events
+> per-customer/per-device and revoke a compromised machine. See
+> [`docs/cloud-mvp.md`](docs/cloud-mvp.md).
 
 ## Cloud shipping (optional, off by default)
 

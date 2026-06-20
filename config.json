@@ -4,17 +4,11 @@
     "api.github.com",
     "registry.npmjs.org",
     "pypi.org",
-    "files.pythonhosted.org"
+    "files.pythonhosted.org",
+    "fyxer.com"
   ],
   "approved_mcp": [
     "github",
     "linear"
-  ],
-  "cloud": {
-  "enabled": true,
-  "sinks": [
-    { "name": "local",   "type": "file" },
-    { "name": "preview", "type": "https", "endpoint": "http://127.0.0.1:8000/api/ingest" }
   ]
-}
 }

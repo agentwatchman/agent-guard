@@ -1,4 +1,4 @@
-.PHONY: build run test release clean install uninstall deploy setup bootstrap doctor purge service-restart service-reload service-status \
+.PHONY: build run run-local test release clean install uninstall deploy setup bootstrap doctor purge service-restart service-reload service-status \
         build-kingfisher install-kingfisher uninstall-kingfisher
 
 # Where the manual (non-Homebrew) install puts things. Override with: make install PREFIX=/opt
@@ -21,6 +21,11 @@ build:
 # Run the daemon with the example config
 run: build
 	./bin/agentguard --config config.json
+
+# Run with the local (gitignored) config — used to test cloud shipping against
+# the preview control plane in tools/cloud-preview/ without committing settings.
+run-local: build
+	./bin/agentguard --config config.local.json
 
 # Run the smoke test (daemon must already be running)
 test:
