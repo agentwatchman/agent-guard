@@ -40,6 +40,14 @@ credentials.json
 enrollment*.json
 device-token*
 
+# --- Python (tools/cloud-preview dev harness) ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.Python
+*.egg-info/
+
 # --- OS / editor cruft ---
 .DS_Store
 .DS_Store?
