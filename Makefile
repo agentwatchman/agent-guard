@@ -1,5 +1,5 @@
 .PHONY: build run run-local test release clean install uninstall deploy setup bootstrap doctor purge service-restart service-reload service-status \
-        build-kingfisher install-kingfisher uninstall-kingfisher
+        build-kingfisher install-kingfisher uninstall-kingfisher svc-install-macos svc-install-linux svc-remove-macos svc-remove-linux
 
 # Where the manual (non-Homebrew) install puts things. Override with: make install PREFIX=/opt
 PREFIX ?= /usr/local
@@ -13,6 +13,35 @@ USERCFG = $(HOME)/.agentguard/config.json
 KFLABEL  = com.agentguard.kingfisherd
 KFPLIST  = $(HOME)/Library/LaunchAgents/$(KFLABEL).plist
 KFSOCKET = $(HOME)/.agentguard/kingfisherd.sock
+
+# --- OS detection: macOS (launchd) vs Linux (systemd) ----------------------
+# Detect the platform once, then define per-OS commands so the targets below
+# stay platform-agnostic and `make <target>` works on both.
+#   - one-liner differences (status/restart/reload) -> command variables
+#   - multi-step differences (install/uninstall)     -> a TARGET NAME to dispatch to
+UNAME := $(shell uname -s)
+
+ifeq ($(UNAME),Darwin)
+  # ---- macOS / launchd ----
+  BIN_PATH    := $(PREFIX)/bin/agentguard
+  BIN_INSTALL := sudo install -d "$(PREFIX)/bin" && sudo install -m 0755 bin/agentguard "$(PREFIX)/bin/agentguard"
+  BIN_REMOVE  := sudo rm -f "$(PREFIX)/bin/agentguard"
+  SVC_INSTALL := svc-install-macos
+  SVC_REMOVE  := svc-remove-macos
+  SVC_STATUS  := launchctl print gui/$$(id -u)/$(LABEL) | grep -E 'state|pid' || echo "not loaded"
+  SVC_RESTART := launchctl kickstart -k gui/$$(id -u)/$(LABEL)
+  SVC_RELOAD  := launchctl kill SIGHUP gui/$$(id -u)/$(LABEL) && echo "sent SIGHUP - config reloaded (check: make service-status or tail /tmp/agentguard.err.log)"
+else
+  # ---- Linux / systemd user service ----
+  BIN_PATH    := $(HOME)/.local/bin/agentguard
+  BIN_INSTALL := install -d "$(HOME)/.local/bin" && install -m 0755 bin/agentguard "$(HOME)/.local/bin/agentguard"
+  BIN_REMOVE  := rm -f "$(HOME)/.local/bin/agentguard"
+  SVC_INSTALL := svc-install-linux
+  SVC_REMOVE  := svc-remove-linux
+  SVC_STATUS  := systemctl --user status agentguard
+  SVC_RESTART := systemctl --user restart agentguard
+  SVC_RELOAD  := systemctl --user reload agentguard && echo "sent SIGHUP via systemd - config reloaded"
+endif
 
 # Local build
 build:
@@ -40,15 +69,23 @@ release:
 	GOOS=windows GOARCH=amd64 go build -o dist/agentguard-windows-amd64.exe ./cmd/agentguard
 
 # --- Manual install path (no Homebrew) -------------------------------------
-# Installs the binary + config to $(PREFIX), then registers a launchd LaunchAgent
-# so the daemon runs in the background at login. macOS only.
+# Installs the binary + config, then registers the background service for the
+# host OS (launchd on macOS, systemd --user on Linux) so the daemon runs at
+# login. Cross-platform: the OS-specific steps live in the svc-install-* targets,
+# selected by $(SVC_INSTALL) in the OS-detection block above.
 install: build
-	sudo install -d "$(PREFIX)/bin"
-	sudo install -m 0755 bin/agentguard "$(PREFIX)/bin/agentguard"
+	$(BIN_INSTALL)
 	mkdir -p "$(HOME)/.agentguard"
 	@[ -f "$(USERCFG)" ] \
 		&& echo "keeping existing $(USERCFG)" \
 		|| install -m 0644 config.json "$(USERCFG)"
+	$(MAKE) $(SVC_INSTALL)
+	@echo "Policy config: $(USERCFG) (edit it — the daemon auto-reloads within ~2s)"
+	@echo "Wiring detected AI agents (Claude Code / Cursor / Codex)..."
+	"$(BIN_PATH)" install-hooks
+
+# macOS service registration (launchd). Dispatched to via $(SVC_INSTALL).
+svc-install-macos:
 	mkdir -p "$(HOME)/Library/LaunchAgents"
 	sed -e 's#/usr/local/bin/agentguard#$(PREFIX)/bin/agentguard#' \
 	    -e 's#CONFIG_PATH#$(USERCFG)#' \
@@ -64,17 +101,32 @@ install: build
 	 launchctl bootstrap gui/$$(id -u) "$(PLIST)" 2>/dev/null \
 	   || launchctl load -w "$(PLIST)" \
 	   || launchctl kickstart -k gui/$$(id -u)/$(LABEL)
-	@echo "AgentGuard running in the background (unix socket ~/.agentguard/agentguard.sock)"
-	@echo "Policy config: $(USERCFG) (edit it — the daemon auto-reloads within ~2s)"
-	@echo "Wiring detected AI agents (Claude Code / Cursor)..."
-	"$(PREFIX)/bin/agentguard" install-hooks
+	@echo "AgentGuard running in the background (launchd: $(LABEL))"
+
+# Linux service registration (systemd user service). Dispatched to via $(SVC_INSTALL).
+svc-install-linux:
+	mkdir -p "$(HOME)/.config/systemd/user"
+	cp packaging/systemd/agentguard.service "$(HOME)/.config/systemd/user/agentguard.service"
+	systemctl --user daemon-reload
+	systemctl --user enable --now agentguard
+	@echo "AgentGuard running in the background (systemd --user: agentguard.service)"
 
 uninstall:
-	-"$(PREFIX)/bin/agentguard" uninstall-hooks 2>/dev/null
+	-"$(BIN_PATH)" uninstall-hooks 2>/dev/null
+	$(MAKE) $(SVC_REMOVE)
+	$(BIN_REMOVE)
+	@echo "Removed binary + service + agent hooks. Config kept at $(USERCFG) (delete manually if desired)."
+
+# macOS service removal (launchd). Dispatched to via $(SVC_REMOVE).
+svc-remove-macos:
 	-launchctl bootout gui/$$(id -u)/$(LABEL) 2>/dev/null
 	rm -f "$(PLIST)"
-	sudo rm -f "$(PREFIX)/bin/agentguard"
-	@echo "Removed binary + service + agent hooks. Config kept at $(USERCFG) (delete manually if desired)."
+
+# Linux service removal (systemd user service). Dispatched to via $(SVC_REMOVE).
+svc-remove-linux:
+	-systemctl --user disable --now agentguard 2>/dev/null
+	rm -f "$(HOME)/.config/systemd/user/agentguard.service"
+	systemctl --user daemon-reload
 
 # --- Complete teardown -----------------------------------------------------
 # Removes EVERYTHING AgentGuard installed: both binaries, both launchd services,
@@ -224,15 +276,15 @@ uninstall-kingfisher:
 	@echo "Removed kingfisherd; inline scans fall back to the builtin scanner."
 
 service-restart:
-	launchctl kickstart -k gui/$$(id -u)/$(LABEL)
+	$(SVC_RESTART)
 
 # Force a config reload via SIGHUP. Usually unnecessary: the daemon auto-reloads
 # $(USERCFG) within ~2s of an edit. Kept for scripted/immediate reloads.
 service-reload:
-	launchctl kill SIGHUP gui/$$(id -u)/$(LABEL) && echo "sent SIGHUP — config reloaded (check: make service-status or tail /tmp/agentguard.err.log)"
+	$(SVC_RELOAD)
 
 service-status:
-	launchctl print gui/$$(id -u)/$(LABEL) | grep -E 'state|pid' || echo "not loaded"
+	@$(SVC_STATUS)
 
 clean:
 	rm -rf bin dist

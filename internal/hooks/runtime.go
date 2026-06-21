@@ -143,7 +143,7 @@ func handleClaudeFormat(data []byte, agent string, cannotAsk bool) {
 	resp, err := postEvaluate(e)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "agentguard: daemon unreachable:", err)
-		resp = types.Decide(types.Deny, "AgentGuard daemon unreachable — failing closed. Start it: brew services start agentguard")
+		resp = types.Decide(types.Deny, "AgentGuard daemon unreachable — failing closed. Start it: "+startHint())
 	}
 	_ = json.NewEncoder(os.Stdout).Encode(resp)
 }
