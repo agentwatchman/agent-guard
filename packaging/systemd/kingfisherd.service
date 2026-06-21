@@ -1,0 +1,12 @@
+[Unit]
+Description=AgentGuard kingfisherd - resident Kingfisher secret scanner
+Documentation=https://github.com/agentwatchman/agent-guard
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/kingfisherd --socket %h/.agentguard/kingfisherd.sock
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=default.target

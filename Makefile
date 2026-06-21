@@ -1,5 +1,6 @@
 .PHONY: build run run-local test release clean install uninstall deploy setup bootstrap doctor purge service-restart service-reload service-status \
-        build-kingfisher install-kingfisher uninstall-kingfisher svc-install-macos svc-install-linux svc-remove-macos svc-remove-linux
+        build-kingfisher install-kingfisher uninstall-kingfisher svc-install-macos svc-install-linux svc-remove-macos svc-remove-linux \
+        svc-install-kf-macos svc-install-kf-linux svc-remove-kf-macos svc-remove-kf-linux
 
 # Where the manual (non-Homebrew) install puts things. Override with: make install PREFIX=/opt
 PREFIX ?= /usr/local
@@ -31,6 +32,19 @@ ifeq ($(UNAME),Darwin)
   SVC_STATUS  := launchctl print gui/$$(id -u)/$(LABEL) | grep -E 'state|pid' || echo "not loaded"
   SVC_RESTART := launchctl kickstart -k gui/$$(id -u)/$(LABEL)
   SVC_RELOAD  := launchctl kill SIGHUP gui/$$(id -u)/$(LABEL) && echo "sent SIGHUP - config reloaded (check: make service-status or tail /tmp/agentguard.err.log)"
+  KF_BIN_PATH    := $(PREFIX)/bin/kingfisherd
+  KF_BIN_INSTALL := sudo install -m 0755 kingfisherd/target/release/kingfisherd "$(PREFIX)/bin/kingfisherd"
+  KF_BIN_REMOVE  := sudo rm -f "$(PREFIX)/bin/kingfisherd"
+  KF_SVC_INSTALL := svc-install-kf-macos
+  KF_SVC_REMOVE  := svc-remove-kf-macos
+  # KF_BUILD_ENV uses '=' (deferred) so BREW_PREFIX, defined later, expands at recipe time.
+  KF_BUILD_ENV    = BOOST_ROOT="$(BREW_PREFIX)" CMAKE_PREFIX_PATH="$(BREW_PREFIX)"
+  # Package manager + package names for doctor hints / bootstrap installs (brew on macOS).
+  PKG_INSTALL    := brew install
+  BOOST_PKG      := boost
+  GO_INSTALL_CMD := brew install go
+  # Where the build looks for boost headers (macOS: brew prefix; '=' deferred for BREW_PREFIX).
+  BOOST_INCDIR    = $(BREW_PREFIX)/include/boost
 else
   # ---- Linux / systemd user service ----
   BIN_PATH    := $(HOME)/.local/bin/agentguard
@@ -41,6 +55,30 @@ else
   SVC_STATUS  := systemctl --user status agentguard
   SVC_RESTART := systemctl --user restart agentguard
   SVC_RELOAD  := systemctl --user reload agentguard && echo "sent SIGHUP via systemd - config reloaded"
+  KF_BIN_PATH    := $(HOME)/.local/bin/kingfisherd
+  KF_BIN_INSTALL := install -d "$(HOME)/.local/bin" && install -m 0755 kingfisherd/target/release/kingfisherd "$(HOME)/.local/bin/kingfisherd"
+  KF_BIN_REMOVE  := rm -f "$(HOME)/.local/bin/kingfisherd"
+  KF_SVC_INSTALL := svc-install-kf-linux
+  KF_SVC_REMOVE  := svc-remove-kf-linux
+  # Linux: rely on system cmake/boost (apt installs under /usr); no special build env.
+  KF_BUILD_ENV    =
+  # Package manager varies by distro: detect it for doctor hints / bootstrap installs.
+  ifneq (,$(shell command -v apt-get 2>/dev/null))
+    PKG_INSTALL := sudo apt-get install -y
+    BOOST_PKG   := libboost-dev
+  else ifneq (,$(shell command -v dnf 2>/dev/null))
+    PKG_INSTALL := sudo dnf install -y
+    BOOST_PKG   := boost-devel
+  else ifneq (,$(shell command -v pacman 2>/dev/null))
+    PKG_INSTALL := sudo pacman -S --noconfirm
+    BOOST_PKG   := boost
+  else
+    PKG_INSTALL := echo '>> install manually:'
+    BOOST_PKG   := boost
+  endif
+  GO_INSTALL_CMD := echo '>> install Go from https://go.dev/dl (distro packages are often too old)'
+  # The Linux build uses system boost (apt installs headers under /usr/include).
+  BOOST_INCDIR   := /usr/include/boost
 endif
 
 # Local build
@@ -129,26 +167,21 @@ svc-remove-linux:
 	systemctl --user daemon-reload
 
 # --- Complete teardown -----------------------------------------------------
-# Removes EVERYTHING AgentGuard installed: both binaries, both launchd services,
+# Removes EVERYTHING AgentGuard installed: both binaries, both background services,
 # the Claude Code / Cursor hooks, the installed config, and all local state
 # (~/.agentguard: sockets, audit log). Use before a from-scratch reinstall test.
 # Leaves toolchains (go/rust/cmake/boost) untouched — those are yours.
 purge:
-	-"$(PREFIX)/bin/agentguard" uninstall-hooks 2>/dev/null
+	-"$(BIN_PATH)" uninstall-hooks 2>/dev/null
 	-pkill -f 'agentguard --config' 2>/dev/null
 	-pkill -f 'kingfisherd' 2>/dev/null
-	-launchctl bootout gui/$$(id -u)/$(LABEL) 2>/dev/null
-	-launchctl bootout gui/$$(id -u)/$(KFLABEL) 2>/dev/null
-	-launchctl unload "$(PLIST)" 2>/dev/null
-	-launchctl unload "$(KFPLIST)" 2>/dev/null
-	-launchctl remove $(LABEL) 2>/dev/null
-	-launchctl remove $(KFLABEL) 2>/dev/null
-	rm -f "$(PLIST)" "$(KFPLIST)"
-	sudo rm -f "$(PREFIX)/bin/agentguard" "$(PREFIX)/bin/kingfisherd"
-	sudo rm -rf "$(PREFIX)/etc/agentguard"
+	-$(MAKE) $(SVC_REMOVE)
+	-$(MAKE) $(KF_SVC_REMOVE)
+	-$(BIN_REMOVE)
+	-$(KF_BIN_REMOVE)
 	rm -rf "$(HOME)/.agentguard"
 	@echo ""
-	@echo "Purged: binaries, launchd services, agent hooks, config, and ~/.agentguard."
+	@echo "Purged: binaries, services, agent hooks, config, and ~/.agentguard."
 	@echo "Toolchains were left alone. Verify a clean slate with: make doctor"
 
 # --- Preflight check -------------------------------------------------------
@@ -163,7 +196,7 @@ doctor:
 	if command -v go >/dev/null 2>&1; then \
 		echo "  [ok]      go      $$(go version | awk '{print $$3}')  (required)"; \
 	else \
-		echo "  [MISSING] go              (required)  ->  brew install go   (or https://go.dev/dl)"; ok=0; \
+		echo "  [MISSING] go              (required)  ->  install Go: https://go.dev/dl"; ok=0; \
 	fi; \
 	if command -v cargo >/dev/null 2>&1 || [ -x "$$HOME/.cargo/bin/cargo" ]; then \
 		echo "  [ok]      cargo           (kingfisherd)"; \
@@ -173,12 +206,12 @@ doctor:
 	if command -v cmake >/dev/null 2>&1; then \
 		echo "  [ok]      cmake           (kingfisherd)"; \
 	else \
-		echo "  [warn]    cmake           (kingfisherd)  ->  brew install cmake"; \
+		echo "  [warn]    cmake           (kingfisherd)  ->  $(PKG_INSTALL) cmake"; \
 	fi; \
-	if [ -d "$(BREW_PREFIX)/include/boost" ] || brew list boost >/dev/null 2>&1; then \
+	if [ -d "$(BOOST_INCDIR)" ]; then \
 		echo "  [ok]      boost           (kingfisherd)"; \
 	else \
-		echo "  [warn]    boost           (kingfisherd)  ->  brew install boost"; \
+		echo "  [warn]    boost           (kingfisherd)  ->  $(PKG_INSTALL) $(BOOST_PKG)"; \
 	fi; \
 	echo ""; \
 	if [ $$ok -eq 0 ]; then \
@@ -188,18 +221,15 @@ doctor:
 	echo "Required tools present. [warn] items only disable kingfisherd (agent still runs on the builtin scanner)."
 
 # --- Bootstrap toolchains (invasive) ---------------------------------------
-# Installs the build prerequisites: go/cmake/boost via Homebrew and Rust via the
-# official rustup installer. Idempotent — skips anything already present. macOS
-# only. This MODIFIES your system, so it's kept out of `deploy`; use `make setup`
-# to bootstrap then deploy in one go.
+# Installs the build prerequisites (cmake/boost via the OS package manager, Rust
+# via rustup). Idempotent — skips anything already present. Cross-platform: brew
+# on macOS, apt/dnf/pacman on Linux. (Go is not auto-installed — version matters;
+# the hint points at the official download.) This MODIFIES your system, so it's
+# kept out of `deploy`; use `make setup` to bootstrap then deploy in one go.
 bootstrap:
-	@command -v brew >/dev/null 2>&1 || { \
-		echo "Homebrew is required but not installed — get it from https://brew.sh, then re-run."; \
-		exit 1; \
-	}
-	@if command -v go >/dev/null 2>&1; then echo "  go: present"; else echo ">> installing go...";   brew install go; fi
-	@if command -v cmake >/dev/null 2>&1; then echo "  cmake: present"; else echo ">> installing cmake..."; brew install cmake; fi
-	@if [ -d "$(BREW_PREFIX)/include/boost" ] || brew list boost >/dev/null 2>&1; then echo "  boost: present"; else echo ">> installing boost..."; brew install boost; fi
+	@if command -v go >/dev/null 2>&1; then echo "  go: present"; else echo ">> go missing..."; $(GO_INSTALL_CMD); fi
+	@if command -v cmake >/dev/null 2>&1; then echo "  cmake: present"; else echo ">> installing cmake..."; $(PKG_INSTALL) cmake; fi
+	@if [ -d "$(BOOST_INCDIR)" ]; then echo "  boost: present"; else echo ">> installing boost..."; $(PKG_INSTALL) $(BOOST_PKG); fi
 	@if command -v cargo >/dev/null 2>&1 || [ -x "$$HOME/.cargo/bin/cargo" ]; then echo "  rust: present"; else \
 		echo ">> installing Rust (rustup)..."; \
 		curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; \
@@ -227,13 +257,13 @@ deploy: doctor install
 		echo ""; \
 		echo ">> Skipped kingfisherd (Rust toolchain or build deps missing)."; \
 		echo ">> Inline scans use the builtin scanner. To enable Kingfisher's 950+ rules:"; \
-		echo ">>   brew install cmake boost && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"; \
+		echo ">>   $(PKG_INSTALL) cmake $(BOOST_PKG) && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"; \
 		echo ">>   source ~/.cargo/env && make install-kingfisher"; \
 	}
 	@echo ""
 	@echo "================================================================"
 	@echo " AgentGuard is deployed and running."
-	@echo "   daemon:   $(PREFIX)/bin/agentguard  (launchd: $(LABEL))"
+	@echo "   daemon:   $(BIN_PATH)  (background service)"
 	@echo "   hooks:    Claude Code / Cursor / Codex (detected agents wired — see above)"
 	@echo "   inline:   kingfisherd if present, else builtin scanner"
 	@echo "================================================================"
@@ -251,10 +281,15 @@ BREW_PREFIX := $(shell brew --prefix 2>/dev/null || echo /usr/local)
 # Homebrew keg-only rustup -> $(brew --prefix rustup)/bin, or already on PATH).
 CARGO_PATH := $(HOME)/.cargo/bin:$(BREW_PREFIX)/opt/rustup/bin:$(PATH)
 build-kingfisher:
-	cd kingfisherd && PATH="$(CARGO_PATH)" BOOST_ROOT="$(BREW_PREFIX)" CMAKE_PREFIX_PATH="$(BREW_PREFIX)" cargo build --release
+	cd kingfisherd && PATH="$(CARGO_PATH)" $(KF_BUILD_ENV) cargo build --release
 
 install-kingfisher: build-kingfisher
-	sudo install -m 0755 kingfisherd/target/release/kingfisherd "$(PREFIX)/bin/kingfisherd"
+	$(KF_BIN_INSTALL)
+	$(MAKE) $(KF_SVC_INSTALL)
+	@echo "kingfisherd running — inline scans now use Kingfisher's 950+ rules (fast, compiled once)."
+
+# macOS kingfisherd service registration (launchd). Dispatched to via $(KF_SVC_INSTALL).
+svc-install-kf-macos:
 	mkdir -p "$(HOME)/Library/LaunchAgents"
 	sed -e 's#/usr/local/bin/kingfisherd#$(PREFIX)/bin/kingfisherd#' \
 	    -e 's#SOCKET_PATH#$(KFSOCKET)#' \
@@ -267,13 +302,29 @@ install-kingfisher: build-kingfisher
 	 launchctl bootstrap gui/$$(id -u) "$(KFPLIST)" 2>/dev/null \
 	   || launchctl load -w "$(KFPLIST)" \
 	   || launchctl kickstart -k gui/$$(id -u)/$(KFLABEL)
-	@echo "kingfisherd running — inline scans now use Kingfisher's 950+ rules (fast, compiled once)."
+
+# Linux kingfisherd service registration (systemd user service). Dispatched to via $(KF_SVC_INSTALL).
+svc-install-kf-linux:
+	mkdir -p "$(HOME)/.config/systemd/user"
+	cp packaging/systemd/kingfisherd.service "$(HOME)/.config/systemd/user/kingfisherd.service"
+	systemctl --user daemon-reload
+	systemctl --user enable --now kingfisherd
 
 uninstall-kingfisher:
+	$(MAKE) $(KF_SVC_REMOVE)
+	$(KF_BIN_REMOVE)
+	@echo "Removed kingfisherd; inline scans fall back to the builtin scanner."
+
+# macOS kingfisherd service removal (launchd). Dispatched to via $(KF_SVC_REMOVE).
+svc-remove-kf-macos:
 	-launchctl bootout gui/$$(id -u)/$(KFLABEL) 2>/dev/null
 	rm -f "$(KFPLIST)"
-	sudo rm -f "$(PREFIX)/bin/kingfisherd"
-	@echo "Removed kingfisherd; inline scans fall back to the builtin scanner."
+
+# Linux kingfisherd service removal (systemd user service). Dispatched to via $(KF_SVC_REMOVE).
+svc-remove-kf-linux:
+	-systemctl --user disable --now kingfisherd 2>/dev/null
+	rm -f "$(HOME)/.config/systemd/user/kingfisherd.service"
+	systemctl --user daemon-reload
 
 service-restart:
 	$(SVC_RESTART)
