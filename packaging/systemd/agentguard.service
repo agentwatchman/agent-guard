@@ -1,0 +1,13 @@
+[Unit]
+Description=AgentGuard - local runtime guardrails for AI coding agents
+Documentation=https://github.com/agentwatchman/agent-guard
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/agentguard --config %h/.agentguard/config.json
+Restart=always
+RestartSec=1
+ExecReload=/bin/kill -HUP $MAINPID
+
+[Install]
+WantedBy=default.target

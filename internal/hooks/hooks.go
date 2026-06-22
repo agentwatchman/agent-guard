@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -24,6 +25,14 @@ func cursorHooksPath(home string) string    { return filepath.Join(home, ".curso
 func codexHooksPath(home string) string     { return filepath.Join(home, ".codex", "hooks.json") }
 
 // ---- install / uninstall commands ------------------------------------------
+
+func startHint() string {
+	if runtime.GOOS == "darwin" {
+		return "brew services start agentguard"
+	}
+
+	return "systemctl --user start agentguard"
+}
 
 // Install wires the detected (or flag-selected) agents to the daemon. self is
 // resolved from the running executable.
@@ -53,7 +62,7 @@ func Install(args []string) error {
 		}
 		fmt.Printf("installed %s %s -> %s\n", a.Label, a.installMsg, p)
 	}
-	fmt.Println("Done. Make sure the daemon is running (brew services start agentguard, or make install).")
+	fmt.Println("Done. Make sure the daemon is running (" + startHint() + ", or make install).")
 	return nil
 }
 
