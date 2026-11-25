@@ -8,7 +8,7 @@ Nothing leaves the machine — evaluation is local, and only a redacted one-line
 record is written to a local audit log.
 
 This is the pilot build: **local-first, no accounts, no multi-tenancy.** The goal
-is to prove value on real machines (e.g. the Fyxer pilot) with the least moving
+is to prove value on real machines with the least moving
 parts. Optional redacted [cloud shipping](#cloud-shipping-optional-off-by-default)
 exists but is **off by default**.
 
